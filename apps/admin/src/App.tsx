@@ -1384,9 +1384,9 @@ function ClientSetupView({
     () => routableModelsForWireApis(models, routes, accounts, ["openai-chat"]),
     [accounts, models, routes],
   );
-  const [codexModel, setCodexModel] = useState(catalogModels[0] ?? "gpt-5");
-  const [claudeModel, setClaudeModel] = useState(catalogModels[0] ?? "claude-sonnet-4-5");
-  const [opencodeModel, setOpencodeModel] = useState(catalogModels[0] ?? "deepseek-v4");
+  const [codexModel, setCodexModel] = useState("");
+  const [claudeModel, setClaudeModel] = useState("");
+  const [opencodeModel, setOpencodeModel] = useState("");
 
   useEffect(() => {
     setCodexModel((current) => preferredCatalogModel(current, catalogModels, "gpt-5"));
@@ -1449,79 +1449,95 @@ function ClientSetupView({
               autoComplete="off"
             />
           </Field>
-          <div className="grid gap-3 sm:grid-cols-2">
+          <div className="flex flex-col gap-3">
             <SettingRow label="OpenAI base" value={snippets.openaiBaseUrl} />
             <SettingRow label="Anthropic base" value={snippets.anthropicBaseUrl} />
-            <SettingRow label="Catalog models" value={String(catalogModels.length)} />
-            <SettingRow label="Chat routed" value={String(opencodeModels.length)} />
-            <SettingRow label="Responses routed" value={String(codexModels.length)} />
-            <SettingRow label="Messages routed" value={String(claudeModels.length)} />
+            <div className="grid gap-3 sm:grid-cols-2">
+              <SettingRow label="Catalog models" value={String(catalogModels.length)} />
+              <SettingRow label="Chat routed" value={String(opencodeModels.length)} />
+              <SettingRow label="Responses routed" value={String(codexModels.length)} />
+              <SettingRow label="Messages routed" value={String(claudeModels.length)} />
+            </div>
           </div>
-          <ClientModelField
-            id="setup-codex-model"
-            label="Codex model"
-            value={codexModel}
-            onChange={setCodexModel}
-            hints={catalogModels}
-          />
-          <ClientModelField
-            id="setup-claude-model"
-            label="Claude Code model"
-            value={claudeModel}
-            onChange={setClaudeModel}
-            hints={catalogModels}
-          />
-          <ClientModelField
-            id="setup-opencode-model"
-            label="opencode model"
-            value={opencodeModel}
-            onChange={setOpencodeModel}
-            hints={catalogModels}
-          />
-          <Alert className="lg:col-span-2">
-            <TerminalSquareIcon className="size-4" />
-            <AlertTitle>Client setup uses every catalog model</AlertTitle>
-            <AlertDescription>
-              Provider routes still determine which relay endpoints can serve each model.
-            </AlertDescription>
-          </Alert>
+          {catalogModels.length === 0 ? (
+            <Alert className="lg:col-span-2">
+              <DatabaseIcon className="size-4" />
+              <AlertTitle>No catalog models yet</AlertTitle>
+              <AlertDescription>
+                Add exact model names in Model Catalog, then bind them to provider routes. Client
+                setup will populate from that catalog.
+              </AlertDescription>
+            </Alert>
+          ) : (
+            <div className="grid gap-4 lg:col-span-2 lg:grid-cols-3">
+              <ClientModelField
+                id="setup-codex-model"
+                label="Codex"
+                value={codexModel}
+                onChange={setCodexModel}
+                options={catalogModels}
+                routedOptions={codexModels}
+                routeLabel="Responses"
+              />
+              <ClientModelField
+                id="setup-claude-model"
+                label="Claude Code"
+                value={claudeModel}
+                onChange={setClaudeModel}
+                options={catalogModels}
+                routedOptions={claudeModels}
+                routeLabel="Messages"
+              />
+              <ClientModelField
+                id="setup-opencode-model"
+                label="opencode"
+                value={opencodeModel}
+                onChange={setOpencodeModel}
+                options={catalogModels}
+                routedOptions={opencodeModels}
+                routeLabel="Chat"
+              />
+            </div>
+          )}
         </CardContent>
       </Card>
 
-      <Tabs defaultValue="codex">
-        <TabsList>
-          <TabsTrigger value="codex">Codex</TabsTrigger>
-          <TabsTrigger value="claude">Claude Code</TabsTrigger>
-          <TabsTrigger value="opencode">opencode</TabsTrigger>
-        </TabsList>
-        <TabsContent value="codex">
-          <ClientSnippetCard
-            title="Codex profile"
-            description="Writes a dedicated profile using the Responses wire API."
-            endpoint="/openai/v1/responses"
-            model={codexModel}
-            snippet={snippets.codex}
-          />
-        </TabsContent>
-        <TabsContent value="claude">
-          <ClientSnippetCard
-            title="Claude Code environment"
-            description="Points Claude Code at the Anthropic Messages namespace."
-            endpoint="/anthropic/v1/messages"
-            model={claudeModel}
-            snippet={snippets.claudeCode}
-          />
-        </TabsContent>
-        <TabsContent value="opencode">
-          <ClientSnippetCard
-            title="opencode project config"
-            description="Creates an OpenAI-compatible provider backed by the chat namespace."
-            endpoint="/openai/v1/chat/completions"
-            model={opencodeModel}
-            snippet={snippets.opencode}
-          />
-        </TabsContent>
-      </Tabs>
+      {catalogModels.length > 0 ? (
+        <Tabs defaultValue="codex">
+          <TabsList>
+            <TabsTrigger value="codex">Codex</TabsTrigger>
+            <TabsTrigger value="claude">Claude Code</TabsTrigger>
+            <TabsTrigger value="opencode">opencode</TabsTrigger>
+          </TabsList>
+          <TabsContent value="codex">
+            <ClientSnippetCard
+              title="Codex profile"
+              description="Writes a dedicated profile using the Responses wire API."
+              endpoint="/openai/v1/responses"
+              model={codexModel}
+              snippet={snippets.codex}
+            />
+          </TabsContent>
+          <TabsContent value="claude">
+            <ClientSnippetCard
+              title="Claude Code environment"
+              description="Points Claude Code at the Anthropic Messages namespace."
+              endpoint="/anthropic/v1/messages"
+              model={claudeModel}
+              snippet={snippets.claudeCode}
+            />
+          </TabsContent>
+          <TabsContent value="opencode">
+            <ClientSnippetCard
+              title="opencode project config"
+              description="Creates an OpenAI-compatible provider backed by the chat namespace."
+              endpoint="/openai/v1/chat/completions"
+              model={opencodeModel}
+              snippet={snippets.opencode}
+            />
+          </TabsContent>
+        </Tabs>
+      ) : null}
     </div>
   );
 }
@@ -1531,41 +1547,44 @@ function ClientModelField({
   label,
   value,
   onChange,
-  hints,
+  options,
+  routedOptions,
+  routeLabel,
 }: {
   id: string;
   label: string;
   value: string;
   onChange: (value: string) => void;
-  hints: string[];
+  options: string[];
+  routedOptions: string[];
+  routeLabel: string;
 }) {
+  const isRouted = routedOptions.includes(value);
   return (
-    <div className="flex flex-col gap-2">
-      <Field label={label} htmlFor={id}>
-        <Input
-          id={id}
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-          placeholder="Exact model name"
-        />
-      </Field>
-      {hints.length > 0 ? (
-        <div className="flex max-h-40 flex-wrap gap-2 overflow-auto rounded-md border p-2">
-          {hints.map((hint) => (
-            <Button
-              key={hint}
-              type="button"
-              variant={hint === value ? "secondary" : "outline"}
-              size="xs"
-              onClick={() => onChange(hint)}
-            >
-              {hint}
-            </Button>
-          ))}
+    <div className="flex flex-col gap-3 rounded-md border p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex flex-col gap-1">
+          <Label htmlFor={id}>{label}</Label>
+          <span className="text-xs text-muted-foreground">{routeLabel} route required</span>
         </div>
-      ) : (
-        <span className="text-xs text-muted-foreground">No catalog models yet.</span>
-      )}
+        <Badge variant={isRouted ? "secondary" : "outline"}>
+          {isRouted ? "routed" : "not routed"}
+        </Badge>
+      </div>
+      <Select value={value} onValueChange={onChange}>
+        <SelectTrigger id={id}>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectGroup>
+            {options.map((model) => (
+              <SelectItem key={model} value={model}>
+                {model}
+              </SelectItem>
+            ))}
+          </SelectGroup>
+        </SelectContent>
+      </Select>
     </div>
   );
 }
@@ -1736,8 +1755,8 @@ function SettingsView() {
 function SettingRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md border p-3">
-      <span className="text-sm text-muted-foreground">{label}</span>
-      <span className="break-all font-mono text-sm">{value}</span>
+      <span className="shrink-0 text-sm text-muted-foreground">{label}</span>
+      <span className="min-w-0 break-words text-right font-mono text-sm">{value}</span>
     </div>
   );
 }
