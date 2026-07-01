@@ -24,8 +24,9 @@ use crate::{
     auth::{extract_api_key, generate_secret, login, logout, me, require_admin},
     error::AppError,
     models::{
-        ApiKeyListResponse, ApiKeyResponse, CreateApiKeyRequest, CreateApiKeyResponse,
-        CreateProviderAccountRequest, Dashboard, HealthResponse, MetricsResponse,
+        AnthropicModel, AnthropicModelListResponse, ApiKeyListResponse, ApiKeyRecord,
+        ApiKeyResponse, CreateApiKeyRequest, CreateApiKeyResponse, CreateProviderAccountRequest,
+        Dashboard, HealthResponse, MetricsResponse, OpenAiModel, OpenAiModelListResponse,
         ProviderAccountListResponse, ProviderAccountResponse, RequestLog, RequestLogListResponse,
         UpdateApiKeyRequest, UpdateProviderAccountRequest,
     },
@@ -108,6 +109,63 @@ pub async fn relay_openai_chat(
     relay_json_endpoint(state, headers, uri, body, WireApi::OpenAiChat).await
 }
 
+pub async fn list_openai_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<OpenAiModelListResponse>, AppError> {
+    authenticate_relay_api_key(&state, &headers, uri.query()).await?;
+    Ok(Json(OpenAiModelListResponse {
+        object: "list".to_string(),
+        data: openai_models(&state).await?,
+    }))
+}
+
+pub async fn get_openai_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(model): Path<String>,
+) -> Result<Json<OpenAiModel>, AppError> {
+    authenticate_relay_api_key(&state, &headers, uri.query()).await?;
+    let model = openai_models(&state)
+        .await?
+        .into_iter()
+        .find(|entry| entry.id == model)
+        .ok_or_else(|| AppError::NotFound("model not found".into()))?;
+    Ok(Json(model))
+}
+
+pub async fn list_anthropic_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<AnthropicModelListResponse>, AppError> {
+    authenticate_relay_api_key(&state, &headers, uri.query()).await?;
+    let data = anthropic_models(&state).await?;
+    Ok(Json(AnthropicModelListResponse {
+        first_id: data.first().map(|model| model.id.clone()),
+        last_id: data.last().map(|model| model.id.clone()),
+        data,
+        has_more: false,
+    }))
+}
+
+pub async fn get_anthropic_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(model): Path<String>,
+) -> Result<Json<AnthropicModel>, AppError> {
+    authenticate_relay_api_key(&state, &headers, uri.query()).await?;
+    let model = anthropic_models(&state)
+        .await?
+        .into_iter()
+        .find(|entry| entry.id == model)
+        .ok_or_else(|| AppError::NotFound("model not found".into()))?;
+    Ok(Json(model))
+}
+
 #[derive(Debug, Clone, Copy)]
 enum WireApi {
     AnthropicMessages,
@@ -156,16 +214,7 @@ async fn relay_json_endpoint(
     wire_api: WireApi,
 ) -> Result<Response, AppError> {
     let started = Instant::now();
-    let api_key = extract_api_key(&headers, uri.query())
-        .ok_or_else(|| AppError::Unauthorized("missing API key".into()))?;
-    if !api_key.starts_with(&state.config.api_key_prefix) {
-        return Err(AppError::Unauthorized("invalid API key prefix".into()));
-    }
-    let api_key = state
-        .db
-        .validate_api_key(&api_key)
-        .await?
-        .ok_or_else(|| AppError::Unauthorized("invalid or inactive API key".into()))?;
+    let api_key = authenticate_relay_api_key(&state, &headers, uri.query()).await?;
 
     let request_json: Value = serde_json::from_slice(&body)
         .map_err(|error| AppError::BadRequest(format!("invalid JSON body: {error}")))?;
@@ -623,6 +672,52 @@ fn parse_usage(bytes: &[u8]) -> (u64, u64) {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     (input, output)
+}
+
+async fn authenticate_relay_api_key(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Result<ApiKeyRecord, AppError> {
+    let api_key = extract_api_key(headers, query)
+        .ok_or_else(|| AppError::Unauthorized("missing API key".into()))?;
+    if !api_key.starts_with(&state.config.api_key_prefix) {
+        return Err(AppError::Unauthorized("invalid API key prefix".into()));
+    }
+    state
+        .db
+        .validate_api_key(&api_key)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("invalid or inactive API key".into()))
+}
+
+async fn openai_models(state: &AppState) -> Result<Vec<OpenAiModel>, AppError> {
+    let models = state
+        .db
+        .list_model_catalog(&["openai-chat", "openai-responses"])
+        .await?;
+    Ok(models
+        .into_iter()
+        .map(|model| OpenAiModel {
+            id: model.id,
+            object: "model".to_string(),
+            created: model.created_at.timestamp(),
+            owned_by: model.provider,
+        })
+        .collect())
+}
+
+async fn anthropic_models(state: &AppState) -> Result<Vec<AnthropicModel>, AppError> {
+    let models = state.db.list_model_catalog(&["anthropic-messages"]).await?;
+    Ok(models
+        .into_iter()
+        .map(|model| AnthropicModel {
+            r#type: "model".to_string(),
+            display_name: model.id.clone(),
+            id: model.id,
+            created_at: model.created_at,
+        })
+        .collect())
 }
 
 fn map_not_found(error: rusqlite::Error) -> AppError {

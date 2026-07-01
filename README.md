@@ -50,6 +50,14 @@ curl http://localhost:3000/openai/v1/responses \
   -d '{"model":"gpt-5","input":"hello"}'
 ```
 
+Model discovery uses the same relay API key authentication. Concrete model names
+come from active provider accounts with a non-empty `model_hint`:
+
+```bash
+curl http://localhost:3000/openai/v1/models \
+  -H "Authorization: Bearer tokentoxication-..."
+```
+
 ## Provider Accounts
 
 Each provider account has a `wire_api` protocol:
@@ -65,7 +73,8 @@ auth mode, wire protocol, priority, and optional `model_hint`. For
 OpenAI-compatible chat providers such as Qwen, Kimi, GLM, and DeepSeek, create
 accounts with `openai-chat` and model hints such as `qwen`, `kimi`, `glm`, or
 `deepseek`; clients can keep using `/openai/v1/chat/completions` and switch only
-the model name.
+the model name. Use exact model names as `model_hint` values when clients need
+`/openai/v1/models` or `/anthropic/v1/models` discovery.
 
 For Codex, add an OpenAI provider account with base URL
 `https://api.openai.com`, Bearer auth, and `openai-responses`. Configure Codex
@@ -91,4 +100,3 @@ The backend emits the ignored `openapi/token-toxication.openapi.json` with
 `utoipa`.
 The admin UI SDK under `apps/admin/src/generated/token-toxication` is generated
 with `openapi-nexus`.
-

@@ -2,11 +2,12 @@ use axum::Json;
 use utoipa::OpenApi;
 
 use crate::models::{
-    AdminUser, ApiKeyListResponse, ApiKeyResponse, ApiKeyView, CreateApiKeyRequest,
-    CreateApiKeyResponse, CreateProviderAccountRequest, Dashboard, ErrorDetail, ErrorResponse,
-    HealthResponse, LoginRequest, LoginResponse, MetricsResponse, ProviderAccount,
-    ProviderAccountListResponse, ProviderAccountResponse, RequestLog, RequestLogListResponse,
-    UpdateApiKeyRequest, UpdateProviderAccountRequest, UsageSummary,
+    AdminUser, AnthropicModel, AnthropicModelListResponse, ApiKeyListResponse, ApiKeyResponse,
+    ApiKeyView, CreateApiKeyRequest, CreateApiKeyResponse, CreateProviderAccountRequest, Dashboard,
+    ErrorDetail, ErrorResponse, HealthResponse, LoginRequest, LoginResponse, MetricsResponse,
+    OpenAiModel, OpenAiModelListResponse, ProviderAccount, ProviderAccountListResponse,
+    ProviderAccountResponse, RequestLog, RequestLogListResponse, UpdateApiKeyRequest,
+    UpdateProviderAccountRequest, UsageSummary,
 };
 
 #[derive(OpenApi)]
@@ -33,12 +34,18 @@ use crate::models::{
         update_provider_account,
         delete_provider_account,
         list_request_logs,
+        list_anthropic_models,
+        get_anthropic_model,
+        list_openai_models,
+        get_openai_model,
         relay_anthropic_messages,
         relay_openai_chat_completions,
         relay_openai_responses,
     ),
     components(schemas(
         AdminUser,
+        AnthropicModel,
+        AnthropicModelListResponse,
         ApiKeyListResponse,
         ApiKeyResponse,
         ApiKeyView,
@@ -52,6 +59,8 @@ use crate::models::{
         LoginRequest,
         LoginResponse,
         MetricsResponse,
+        OpenAiModel,
+        OpenAiModelListResponse,
         ProviderAccount,
         ProviderAccountListResponse,
         ProviderAccountResponse,
@@ -232,6 +241,54 @@ pub fn delete_provider_account() {}
     responses((status = 200, description = "Request logs", body = RequestLogListResponse)),
 )]
 pub fn list_request_logs() {}
+
+#[utoipa::path(
+    get,
+    path = "/anthropic/v1/models",
+    tag = "Relay",
+    responses(
+        (status = 200, description = "Configured Anthropic-compatible models", body = AnthropicModelListResponse),
+        (status = 401, description = "Missing or invalid API key", body = ErrorResponse),
+    ),
+)]
+pub fn list_anthropic_models() {}
+
+#[utoipa::path(
+    get,
+    path = "/anthropic/v1/models/{model}",
+    tag = "Relay",
+    params(("model" = String, Path, description = "Model id")),
+    responses(
+        (status = 200, description = "Configured Anthropic-compatible model", body = AnthropicModel),
+        (status = 401, description = "Missing or invalid API key", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+    ),
+)]
+pub fn get_anthropic_model() {}
+
+#[utoipa::path(
+    get,
+    path = "/openai/v1/models",
+    tag = "Relay",
+    responses(
+        (status = 200, description = "Configured OpenAI-compatible models", body = OpenAiModelListResponse),
+        (status = 401, description = "Missing or invalid API key", body = ErrorResponse),
+    ),
+)]
+pub fn list_openai_models() {}
+
+#[utoipa::path(
+    get,
+    path = "/openai/v1/models/{model}",
+    tag = "Relay",
+    params(("model" = String, Path, description = "Model id")),
+    responses(
+        (status = 200, description = "Configured OpenAI-compatible model", body = OpenAiModel),
+        (status = 401, description = "Missing or invalid API key", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+    ),
+)]
+pub fn get_openai_model() {}
 
 #[utoipa::path(
     post,

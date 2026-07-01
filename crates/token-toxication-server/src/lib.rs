@@ -13,7 +13,8 @@ use chrono::{DateTime, Utc};
 use config::Config;
 use db::Db;
 use routes::{
-    admin_routes, health, metrics, relay_messages, relay_openai_chat, relay_openai_responses,
+    admin_routes, get_anthropic_model, get_openai_model, health, list_anthropic_models,
+    list_openai_models, metrics, relay_messages, relay_openai_chat, relay_openai_responses,
 };
 use tower_http::{
     cors::CorsLayer,
@@ -40,6 +41,19 @@ pub fn app(state: AppState, static_dir: PathBuf) -> Router {
         .route(
             "/anthropic/v1/messages",
             axum::routing::post(relay_messages),
+        )
+        .route(
+            "/anthropic/v1/models",
+            axum::routing::get(list_anthropic_models),
+        )
+        .route(
+            "/anthropic/v1/models/{model}",
+            axum::routing::get(get_anthropic_model),
+        )
+        .route("/openai/v1/models", axum::routing::get(list_openai_models))
+        .route(
+            "/openai/v1/models/{model}",
+            axum::routing::get(get_openai_model),
         )
         .route(
             "/openai/v1/chat/completions",

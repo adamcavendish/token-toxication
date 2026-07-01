@@ -14,6 +14,14 @@ use crate::{
     },
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCatalogEntry {
+    pub id: String,
+    pub provider: String,
+    pub wire_api: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -370,6 +378,43 @@ impl Db {
              ORDER BY priority DESC, created_at DESC",
         )?;
         rows_to_accounts(&mut stmt, params![])
+    }
+
+    pub async fn list_model_catalog(
+        &self,
+        wire_apis: &[&str],
+    ) -> rusqlite::Result<Vec<ModelCatalogEntry>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT provider, wire_api, model_hint, created_at
+             FROM provider_accounts
+             WHERE is_active = 1
+               AND status != 'blocked'
+               AND model_hint != ''
+             ORDER BY priority DESC, created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ModelCatalogEntry {
+                provider: row.get(0)?,
+                wire_api: row.get(1)?,
+                id: row.get::<_, String>(2)?.trim().to_string(),
+                created_at: parse_time(row.get::<_, String>(3)?.as_str()),
+            })
+        })?;
+        let mut models = Vec::new();
+        for row in rows {
+            let model = row?;
+            if model.id.is_empty()
+                || !wire_apis.contains(&model.wire_api.as_str())
+                || models
+                    .iter()
+                    .any(|existing: &ModelCatalogEntry| existing.id == model.id)
+            {
+                continue;
+            }
+            models.push(model);
+        }
+        Ok(models)
     }
 
     pub async fn select_provider_account(
@@ -880,6 +925,78 @@ mod tests {
                 .await
                 .expect("delete missing api key")
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn model_catalog_lists_active_model_hints_for_wire_api() {
+        let path =
+            std::env::temp_dir().join(format!("token-toxication-{}.sqlite3", Uuid::new_v4()));
+        let db = Db::open(&path).await.expect("open test database");
+
+        db.create_provider_account(CreateProviderAccountRequest {
+            name: "DeepSeek".to_string(),
+            provider: "deepseek".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            auth_mode: "bearer".to_string(),
+            wire_api: "openai-chat".to_string(),
+            api_key: "deepseek-key".to_string(),
+            model_hint: "deepseek-v4-pro".to_string(),
+            is_active: true,
+            priority: 10,
+        })
+        .await
+        .expect("create deepseek account");
+        db.create_provider_account(CreateProviderAccountRequest {
+            name: "Catch all".to_string(),
+            provider: "openai-compatible".to_string(),
+            base_url: "https://catch-all.example.com".to_string(),
+            auth_mode: "bearer".to_string(),
+            wire_api: "openai-chat".to_string(),
+            api_key: "catch-all-key".to_string(),
+            model_hint: String::new(),
+            is_active: true,
+            priority: 0,
+        })
+        .await
+        .expect("create catch-all account");
+        db.create_provider_account(CreateProviderAccountRequest {
+            name: "Inactive".to_string(),
+            provider: "openai".to_string(),
+            base_url: "https://api.openai.com".to_string(),
+            auth_mode: "bearer".to_string(),
+            wire_api: "openai-responses".to_string(),
+            api_key: "openai-key".to_string(),
+            model_hint: "gpt-5".to_string(),
+            is_active: false,
+            priority: 100,
+        })
+        .await
+        .expect("create inactive account");
+        db.create_provider_account(CreateProviderAccountRequest {
+            name: "Duplicate".to_string(),
+            provider: "openai".to_string(),
+            base_url: "https://api.openai.com".to_string(),
+            auth_mode: "bearer".to_string(),
+            wire_api: "openai-responses".to_string(),
+            api_key: "openai-key".to_string(),
+            model_hint: "deepseek-v4-pro".to_string(),
+            is_active: true,
+            priority: 0,
+        })
+        .await
+        .expect("create duplicate account");
+
+        let models = db
+            .list_model_catalog(&["openai-chat", "openai-responses"])
+            .await
+            .expect("list model catalog");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "deepseek-v4-pro");
+        assert_eq!(models[0].provider, "deepseek");
+        assert_eq!(models[0].wire_api, "openai-chat");
 
         let _ = std::fs::remove_file(path);
     }
