@@ -75,11 +75,17 @@ auth mode, wire protocol, priority, and health state. Model names live in the
 model catalog, and provider model routes bind each public model name to a
 provider account plus exact upstream model name.
 
-For OpenAI-compatible chat providers such as Qwen, Kimi, GLM, MiniMax, and
-DeepSeek, create provider accounts with `openai-chat`, add catalog models such
-as `deepseek-v4-pro`, `MiniMax-M3`, or `glm-5.2`, then create primary and backup
-routes for those models. Clients can keep using `/openai/v1/chat/completions`
-and switch only the model name.
+For OpenAI-compatible chat providers such as DeepSeek, Qwen, Kimi, Moonshot AI,
+Z.AI, and Zhipu AI, create provider accounts with `openai-chat`, add catalog
+models such as `deepseek-v4-pro`, `glm-5.2`, or `k2p6`, then create primary and
+backup routes for those models. Clients can keep using
+`/openai/v1/chat/completions` and switch only the model name.
+
+MiniMax and MiniMax token-plan accounts use Anthropic-compatible endpoints in
+opencode. Add them with `anthropic-messages` and base URLs such as
+`https://api.minimax.io/anthropic/v1` or
+`https://api.minimaxi.com/anthropic/v1`, then add exact catalog models such as
+`MiniMax-M3` or `MiniMax-M2.7`.
 
 Provider model routes are exact and case-preserving. If a client sends
 `MiniMax-M3`, Token Toxication looks up that exact catalog model and rewrites the
@@ -108,6 +114,11 @@ For DeepSeek v4, add a DeepSeek provider account with base URL
 `https://api.deepseek.com`, Bearer auth, and `openai-chat`. Use
 `deepseek-v4-flash` or `deepseek-v4-pro` as the client model. OpenAI-compatible
 clients should use base URL `http://localhost:3000/openai/v1`.
+
+Provider presets mirror opencode IDs where available: `minimax`,
+`minimax-coding-plan`, `kimi-for-coding`, `moonshotai`, `zai`,
+`zai-coding-plan`, `zhipuai`, and `zhipuai-coding-plan`. China-region variants
+are also available for MiniMax and Moonshot.
 
 ## Configuration
 

@@ -1094,17 +1094,32 @@ fn bool_to_i64(value: bool) -> i64 {
 }
 
 fn normalize_provider(value: &str) -> String {
-    let trimmed = value.trim().to_lowercase();
-    match trimmed.as_str() {
+    let key = value
+        .trim()
+        .to_lowercase()
+        .replace([' ', '_'], "-")
+        .replace('.', "");
+    match key.as_str() {
         "" | "claude" => "anthropic".to_string(),
         "codex" | "chatgpt" | "chatgpt-plus" | "chatgpt-pro" | "openai-codex" => {
             "codex-subscription".to_string()
         }
         "deepseek-v4" | "deepseek-v4-flash" | "deepseek-v4-pro" => "deepseek".to_string(),
         "dashscope" | "aliyun" | "qwen3" => "qwen".to_string(),
-        "moonshot" => "kimi".to_string(),
-        "zhipu" | "zhipuai" => "glm".to_string(),
-        _ => trimmed,
+        "kimi" => "kimi-for-coding".to_string(),
+        "moonshot" | "moonshot-ai" => "moonshotai".to_string(),
+        "moonshot-cn" | "moonshot-ai-cn" | "kimi-cn" => "moonshotai-cn".to_string(),
+        "minimax-token-plan" | "minimax-plan" => "minimax-coding-plan".to_string(),
+        "minimax-cn-token-plan" | "minimax-cn-plan" => "minimax-cn-coding-plan".to_string(),
+        "z-ai" | "zai" => "zai".to_string(),
+        "z-ai-coding-plan" | "zai-coding-plan" => "zai-coding-plan".to_string(),
+        "zhipu" | "zhipu-ai" | "zhipuai" | "glm" | "bigmodel" => "zhipuai".to_string(),
+        "zhipu-coding-plan"
+        | "zhipu-ai-coding-plan"
+        | "zhipuai-coding-plan"
+        | "glm-coding-plan"
+        | "bigmodel-coding-plan" => "zhipuai-coding-plan".to_string(),
+        _ => key,
     }
 }
 
@@ -1124,8 +1139,21 @@ fn normalize_wire_api(value: &str, provider: &str) -> String {
         "openai" | "openai-chat" | "chat" | "chat-completions" => "openai-chat".to_string(),
         "openai-responses" | "responses" | "codex" => "openai-responses".to_string(),
         "" => match normalize_provider(provider).as_str() {
+            "anthropic"
+            | "minimax"
+            | "minimax-coding-plan"
+            | "minimax-cn"
+            | "minimax-cn-coding-plan" => "anthropic-messages".to_string(),
             "openai" | "codex-subscription" => "openai-responses".to_string(),
-            "deepseek" | "glm" | "kimi" | "qwen" => "openai-chat".to_string(),
+            "deepseek"
+            | "kimi-for-coding"
+            | "moonshotai"
+            | "moonshotai-cn"
+            | "qwen"
+            | "zai"
+            | "zai-coding-plan"
+            | "zhipuai"
+            | "zhipuai-coding-plan" => "openai-chat".to_string(),
             _ => "anthropic-messages".to_string(),
         },
         _ => "anthropic-messages".to_string(),
@@ -1334,12 +1362,44 @@ mod tests {
             "qwen",
             "dashscope",
             "kimi",
+            "kimi-for-coding",
             "moonshot",
+            "moonshotai",
+            "moonshotai-cn",
+            "Z. AI",
+            "zai-coding-plan",
+            "Zhipu. AI",
+            "zhipuai-coding-plan",
             "glm",
-            "zhipu",
         ] {
             assert_eq!(normalize_wire_api("", provider), "openai-chat");
         }
+        assert_eq!(normalize_provider("kimi"), "kimi-for-coding");
+        assert_eq!(normalize_provider("moonshot"), "moonshotai");
+        assert_eq!(normalize_provider("Z. AI"), "zai");
+        assert_eq!(normalize_provider("Zhipu. AI"), "zhipuai");
+    }
+
+    #[test]
+    fn minimax_provider_aliases_default_to_anthropic_messages() {
+        for provider in [
+            "minimax",
+            "MiniMax Token Plan",
+            "minimax-coding-plan",
+            "minimax-cn",
+            "MiniMax CN Token Plan",
+            "minimax-cn-coding-plan",
+        ] {
+            assert_eq!(normalize_wire_api("", provider), "anthropic-messages");
+        }
+        assert_eq!(
+            normalize_provider("MiniMax Token Plan"),
+            "minimax-coding-plan"
+        );
+        assert_eq!(
+            normalize_provider("MiniMax CN Token Plan"),
+            "minimax-cn-coding-plan"
+        );
     }
 
     #[test]
