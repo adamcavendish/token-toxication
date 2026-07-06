@@ -8,6 +8,7 @@ pub mod openapi;
 pub mod provider_catalog;
 pub mod routes;
 pub mod routing;
+pub mod static_assets;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -35,9 +36,8 @@ pub struct AppState {
 
 pub fn app(state: AppState, static_dir: PathBuf) -> Router {
     let index_file = static_dir.join("index.html");
-    let spa = ServeDir::new(static_dir).fallback(ServeFile::new(index_file));
 
-    Router::new()
+    let app = Router::new()
         .route("/health", axum::routing::get(health))
         .route("/metrics", axum::routing::get(metrics))
         .route("/openapi.json", axum::routing::get(openapi::openapi_json))
@@ -66,9 +66,15 @@ pub fn app(state: AppState, static_dir: PathBuf) -> Router {
             "/openai/v1/responses",
             axum::routing::post(relay_openai_responses),
         )
-        .nest("/admin/api", admin_routes(state.clone()))
-        .fallback_service(spa)
-        .layer(TraceLayer::new_for_http())
+        .nest("/admin/api", admin_routes(state.clone()));
+
+    let app = if index_file.exists() {
+        app.fallback_service(ServeDir::new(static_dir).fallback(ServeFile::new(index_file)))
+    } else {
+        app.fallback(axum::routing::get(static_assets::serve_embedded_static))
+    };
+
+    app.layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
