@@ -7,7 +7,6 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, anyhow, bail};
 use axum::{
     Router,
     body::Bytes,
@@ -27,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::RwLock, sync::watch, time::sleep};
 use uuid::Uuid;
 
-use crate::config::AcmeHttp01Config;
+use crate::{config::AcmeHttp01Config, error::AcmeError};
 
 const SHORTLIVED_PROFILE: &str = "shortlived";
 const ACCOUNT_FILE: &str = "account.json";
@@ -111,13 +110,13 @@ impl AcmeIdentifier {
     }
 }
 
-pub(crate) fn parse_acme_identifier(value: &str) -> anyhow::Result<AcmeIdentifier> {
+pub(crate) fn parse_acme_identifier(value: &str) -> Result<AcmeIdentifier, AcmeError> {
     let value = value.trim();
     if value.is_empty() {
-        bail!("ACME identifier must not be empty");
+        return Err(AcmeError::EmptyIdentifier);
     }
     if value.contains("://") || value.contains('/') {
-        bail!("ACME identifier must be a domain name or IP address, not a URL");
+        return Err(AcmeError::IdentifierIsUrl);
     }
     Ok(value
         .parse::<IpAddr>()
@@ -169,7 +168,7 @@ impl AcmeManager {
         }
     }
 
-    pub async fn prepare_certificate(&self) -> anyhow::Result<ManagedCertificate> {
+    pub async fn prepare_certificate(&self) -> Result<ManagedCertificate, AcmeError> {
         self.ensure_cert_dir().await?;
         if let Some(certificate) = self.load_certificate().await? {
             if certificate.info.not_after > Utc::now() {
@@ -242,7 +241,7 @@ impl AcmeManager {
         })
     }
 
-    async fn issue_certificate(&self) -> anyhow::Result<ManagedCertificate> {
+    async fn issue_certificate(&self) -> Result<ManagedCertificate, AcmeError> {
         self.ensure_cert_dir().await?;
         let raw_identifier = self.config.identifier.as_str();
         let identifier = parse_acme_identifier(raw_identifier)?;
@@ -257,7 +256,7 @@ impl AcmeManager {
         let mut order = account
             .new_order(&new_order)
             .await
-            .context("create ACME order")?;
+            .map_err(|source| AcmeError::CreateOrder { source })?;
         let mut challenge_tokens = Vec::new();
         let result = async {
             self.complete_http01_authorizations(&mut order, &mut challenge_tokens)
@@ -266,16 +265,19 @@ impl AcmeManager {
             let status = order
                 .poll_ready(&retry)
                 .await
-                .context("poll ACME order readiness")?;
+                .map_err(|source| AcmeError::PollOrderReady { source })?;
             if status != OrderStatus::Ready {
-                bail!("ACME order did not become ready: {status:?}");
+                return Err(AcmeError::OrderNotReady { status });
             }
-            let private_key_pem = order.finalize().await.context("finalize ACME order")?;
+            let private_key_pem = order
+                .finalize()
+                .await
+                .map_err(|source| AcmeError::FinalizeOrder { source })?;
             let cert_chain_pem = order
                 .poll_certificate(&retry)
                 .await
-                .context("poll ACME certificate")?;
-            anyhow::Ok((cert_chain_pem, private_key_pem))
+                .map_err(|source| AcmeError::PollCertificate { source })?;
+            Ok((cert_chain_pem, private_key_pem))
         }
         .await;
 
@@ -300,26 +302,27 @@ impl AcmeManager {
         );
         self.load_certificate()
             .await?
-            .context("issued ACME certificate was not readable")
+            .ok_or(AcmeError::IssuedCertificateNotReadable)
     }
 
     async fn complete_http01_authorizations(
         &self,
         order: &mut instant_acme::Order,
         challenge_tokens: &mut Vec<String>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AcmeError> {
         let mut authorizations = order.authorizations();
         while let Some(result) = authorizations.next().await {
-            let mut authorization = result.context("load ACME authorization")?;
+            let mut authorization =
+                result.map_err(|source| AcmeError::LoadAuthorization { source })?;
             match authorization.status {
                 AuthorizationStatus::Valid => continue,
                 AuthorizationStatus::Pending => {}
-                other => bail!("ACME authorization is not pending: {other:?}"),
+                status => return Err(AcmeError::AuthorizationNotPending { status }),
             }
 
             let mut challenge = authorization
                 .challenge(ChallengeType::Http01)
-                .ok_or_else(|| anyhow!("ACME authorization did not include http-01 challenge"))?;
+                .ok_or(AcmeError::MissingHttp01Challenge)?;
             let token = challenge.token.clone();
             let key_authorization = challenge.key_authorization().as_str().to_string();
             self.challenges
@@ -329,25 +332,29 @@ impl AcmeManager {
             challenge
                 .set_ready()
                 .await
-                .context("mark ACME http-01 challenge ready")?;
+                .map_err(|source| AcmeError::MarkChallengeReady { source })?;
         }
         Ok(())
     }
 
-    async fn account(&self) -> anyhow::Result<Account> {
+    async fn account(&self) -> Result<Account, AcmeError> {
         let account_path = self.account_path();
         if account_path.exists() && self.account_metadata_matches().await? {
-            let data = tokio::fs::read(&account_path)
-                .await
-                .with_context(|| format!("read {}", account_path.display()))?;
-            let credentials: AccountCredentials =
-                serde_json::from_slice(&data).context("parse ACME account credentials")?;
+            let data =
+                tokio::fs::read(&account_path)
+                    .await
+                    .map_err(|source| AcmeError::ReadFile {
+                        path: account_path.clone(),
+                        source,
+                    })?;
+            let credentials: AccountCredentials = serde_json::from_slice(&data)
+                .map_err(|source| AcmeError::ParseAccountCredentials { source })?;
             return instant_acme::Account::builder_with_http(Box::new(AioductAcmeHttpClient {
                 client: self.http.clone(),
             }))
             .from_credentials(credentials)
             .await
-            .context("restore ACME account");
+            .map_err(|source| AcmeError::RestoreAccount { source });
         }
 
         let contact = format!("mailto:{}", self.config.email.as_str());
@@ -366,9 +373,9 @@ impl AcmeManager {
                 None,
             )
             .await
-            .context("create ACME account")?;
-        let credentials_json =
-            serde_json::to_vec_pretty(&credentials).context("serialize ACME account")?;
+            .map_err(|source| AcmeError::CreateAccount { source })?;
+        let credentials_json = serde_json::to_vec_pretty(&credentials)
+            .map_err(|source| AcmeError::SerializeAccount { source })?;
         write_atomic(&account_path, &credentials_json, 0o600).await?;
         let account_metadata = AccountMetadata {
             directory_url: self.config.directory_url.clone(),
@@ -376,12 +383,12 @@ impl AcmeManager {
             updated_at: Utc::now(),
         };
         let metadata_json = serde_json::to_vec_pretty(&account_metadata)
-            .context("serialize ACME account metadata")?;
+            .map_err(|source| AcmeError::SerializeAccountMetadata { source })?;
         write_atomic(&self.account_metadata_path(), &metadata_json, 0o600).await?;
         Ok(account)
     }
 
-    async fn load_certificate(&self) -> anyhow::Result<Option<ManagedCertificate>> {
+    async fn load_certificate(&self) -> Result<Option<ManagedCertificate>, AcmeError> {
         let cert_path = self.cert_path();
         let key_path = self.key_path();
         if !cert_path.exists() || !key_path.exists() {
@@ -406,7 +413,10 @@ impl AcmeManager {
         }
         let cert_pem = tokio::fs::read(&cert_path)
             .await
-            .with_context(|| format!("read {}", cert_path.display()))?;
+            .map_err(|source| AcmeError::ReadFile {
+                path: cert_path.clone(),
+                source,
+            })?;
         let info = parse_certificate_info(
             &cert_pem,
             expected_identifier.to_string(),
@@ -425,18 +435,22 @@ impl AcmeManager {
         cert_chain_pem: &str,
         private_key_pem: &str,
         info: &CertificateInfo,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AcmeError> {
         write_atomic(&self.cert_path(), cert_chain_pem.as_bytes(), 0o600).await?;
         write_atomic(&self.key_path(), private_key_pem.as_bytes(), 0o600).await?;
-        let metadata = serde_json::to_vec_pretty(info).context("serialize ACME metadata")?;
+        let metadata = serde_json::to_vec_pretty(info)
+            .map_err(|source| AcmeError::SerializeCertificateMetadata { source })?;
         write_atomic(&self.metadata_path(), &metadata, 0o600).await?;
         Ok(())
     }
 
-    async fn ensure_cert_dir(&self) -> anyhow::Result<()> {
+    async fn ensure_cert_dir(&self) -> Result<(), AcmeError> {
         tokio::fs::create_dir_all(&self.config.cert_dir)
             .await
-            .with_context(|| format!("create {}", self.config.cert_dir.display()))?;
+            .map_err(|source| AcmeError::CreateDir {
+                path: self.config.cert_dir.clone(),
+                source,
+            })?;
         set_permissions(&self.config.cert_dir, 0o700).await?;
         Ok(())
     }
@@ -461,28 +475,35 @@ impl AcmeManager {
         self.config.cert_dir.join(METADATA_FILE)
     }
 
-    async fn load_metadata(&self) -> anyhow::Result<Option<CertificateInfo>> {
+    async fn load_metadata(&self) -> Result<Option<CertificateInfo>, AcmeError> {
         let metadata_path = self.metadata_path();
         if !metadata_path.exists() {
             return Ok(None);
         }
         let data = tokio::fs::read(&metadata_path)
             .await
-            .with_context(|| format!("read {}", metadata_path.display()))?;
-        let metadata = serde_json::from_slice(&data).context("parse ACME certificate metadata")?;
+            .map_err(|source| AcmeError::ReadFile {
+                path: metadata_path.clone(),
+                source,
+            })?;
+        let metadata = serde_json::from_slice(&data)
+            .map_err(|source| AcmeError::ParseCertificateMetadata { source })?;
         Ok(Some(metadata))
     }
 
-    async fn account_metadata_matches(&self) -> anyhow::Result<bool> {
+    async fn account_metadata_matches(&self) -> Result<bool, AcmeError> {
         let metadata_path = self.account_metadata_path();
         if !metadata_path.exists() {
             return Ok(false);
         }
         let data = tokio::fs::read(&metadata_path)
             .await
-            .with_context(|| format!("read {}", metadata_path.display()))?;
-        let metadata: AccountMetadata =
-            serde_json::from_slice(&data).context("parse ACME account metadata")?;
+            .map_err(|source| AcmeError::ReadFile {
+                path: metadata_path.clone(),
+                source,
+            })?;
+        let metadata: AccountMetadata = serde_json::from_slice(&data)
+            .map_err(|source| AcmeError::ParseAccountMetadata { source })?;
         Ok(metadata.directory_url == self.config.directory_url
             && metadata.email == self.config.email)
     }
@@ -539,16 +560,22 @@ pub fn parse_certificate_info(
     identifier: String,
     directory_url: String,
     profile: Option<String>,
-) -> anyhow::Result<CertificateInfo> {
-    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem)
-        .map_err(|error| anyhow!("parse certificate PEM: {error}"))?;
-    let (_, certificate) = x509_parser::parse_x509_certificate(&pem.contents)
-        .map_err(|error| anyhow!("parse X.509 certificate: {error}"))?;
+) -> Result<CertificateInfo, AcmeError> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem).map_err(|error| {
+        AcmeError::ParseCertificatePem {
+            message: error.to_string(),
+        }
+    })?;
+    let (_, certificate) = x509_parser::parse_x509_certificate(&pem.contents).map_err(|error| {
+        AcmeError::ParseX509Certificate {
+            message: error.to_string(),
+        }
+    })?;
     let validity = certificate.validity();
     let not_before = DateTime::from_timestamp(validity.not_before.timestamp(), 0)
-        .context("certificate not_before is out of range")?;
+        .ok_or(AcmeError::CertificateNotBeforeOutOfRange)?;
     let not_after = DateTime::from_timestamp(validity.not_after.timestamp(), 0)
-        .context("certificate not_after is out of range")?;
+        .ok_or(AcmeError::CertificateNotAfterOutOfRange)?;
     Ok(CertificateInfo {
         identifier,
         directory_url,
@@ -573,13 +600,18 @@ pub(crate) fn renewal_delay(info: &CertificateInfo, now: DateTime<Utc>) -> Durat
     }
 }
 
-async fn write_atomic(path: &Path, data: &[u8], mode: u32) -> anyhow::Result<()> {
+async fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<(), AcmeError> {
     let parent = path
         .parent()
-        .with_context(|| format!("{} has no parent directory", path.display()))?;
+        .ok_or_else(|| AcmeError::MissingParentDirectory {
+            path: path.to_path_buf(),
+        })?;
     tokio::fs::create_dir_all(parent)
         .await
-        .with_context(|| format!("create {}", parent.display()))?;
+        .map_err(|source| AcmeError::CreateDir {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -587,15 +619,22 @@ async fn write_atomic(path: &Path, data: &[u8], mode: u32) -> anyhow::Result<()>
     let temp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
     tokio::fs::write(&temp_path, data)
         .await
-        .with_context(|| format!("write {}", temp_path.display()))?;
+        .map_err(|source| AcmeError::WriteFile {
+            path: temp_path.clone(),
+            source,
+        })?;
     set_permissions(&temp_path, mode).await?;
     tokio::fs::rename(&temp_path, path)
         .await
-        .with_context(|| format!("rename {} to {}", temp_path.display(), path.display()))?;
+        .map_err(|source| AcmeError::RenameFile {
+            from: temp_path,
+            to: path.to_path_buf(),
+            source,
+        })?;
     Ok(())
 }
 
-async fn set_permissions(path: &Path, mode: u32) -> anyhow::Result<()> {
+async fn set_permissions(path: &Path, mode: u32) -> Result<(), AcmeError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -603,7 +642,10 @@ async fn set_permissions(path: &Path, mode: u32) -> anyhow::Result<()> {
         let permissions = std::fs::Permissions::from_mode(mode);
         tokio::fs::set_permissions(path, permissions)
             .await
-            .with_context(|| format!("set permissions on {}", path.display()))?;
+            .map_err(|source| AcmeError::SetPermissions {
+                path: path.to_path_buf(),
+                source,
+            })?;
     }
     #[cfg(not(unix))]
     {
