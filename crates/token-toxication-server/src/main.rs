@@ -1,9 +1,8 @@
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::Context;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use token_toxication_server::{AppState, app, config::Config, db::Db, server};
+use token_toxication_server::{AppState, app, config::Config, db::Db, error::MainError, server};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa::OpenApi as _;
 
@@ -27,8 +26,7 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
+async fn main() -> Result<(), MainError> {
     let cli = Cli::parse();
 
     if let Some(Command::GenerateOpenapi { output }) = cli.command {
@@ -38,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     run_server(cli.config).await
 }
 
-async fn run_server(config: Config) -> anyhow::Result<()> {
+async fn run_server(config: Config) -> Result<(), MainError> {
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env()
@@ -52,13 +50,16 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
     let config = Arc::new(config);
     let db = Db::open(&config.database_path)
         .await
-        .with_context(|| format!("open database at {}", config.database_path.display()))?;
+        .map_err(|source| MainError::OpenDatabase {
+            path: config.database_path.clone(),
+            source,
+        })?;
     let http = aioduct::TokioClient::builder()
         .tls(aioduct::tls::RustlsConnector::with_webpki_roots())
         .user_agent("token-toxication/0.1")
         .timeout(Duration::from_secs(300))
         .build()
-        .context("build HTTP client")?;
+        .map_err(|source| MainError::BuildHttpClient { source })?;
 
     let state = AppState {
         config: config.clone(),
@@ -68,18 +69,25 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
     };
 
     let app = app(state, config.static_dir.clone());
-    server::serve(config, https_config, app).await
+    server::serve(config, https_config, app).await?;
+    Ok(())
 }
 
-fn generate_openapi(output: PathBuf) -> anyhow::Result<()> {
+fn generate_openapi(output: PathBuf) -> Result<(), MainError> {
     if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create OpenAPI output dir {}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|source| MainError::CreateOpenApiOutputDir {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
 
     let spec = token_toxication_server::openapi::ApiDoc::openapi();
-    let json = serde_json::to_string_pretty(&spec).context("serialize OpenAPI document")?;
-    fs::write(&output, json).with_context(|| format!("write {}", output.display()))?;
+    let json = serde_json::to_string_pretty(&spec)
+        .map_err(|source| MainError::SerializeOpenApi { source })?;
+    fs::write(&output, json).map_err(|source| MainError::WriteOpenApi {
+        path: output.clone(),
+        source,
+    })?;
     println!("wrote {}", output.display());
     Ok(())
 }

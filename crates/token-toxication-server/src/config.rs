@@ -1,7 +1,8 @@
 use std::{net::SocketAddr, path::PathBuf};
 
-use anyhow::{Context, bail};
 use clap::{Args, ValueEnum};
+
+use crate::error::ConfigError;
 
 pub const LETS_ENCRYPT_PRODUCTION_DIRECTORY: &str =
     "https://acme-v02.api.letsencrypt.org/directory";
@@ -111,33 +112,31 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         self.https_config().map(|_| ())
     }
 
-    pub fn https_config(&self) -> anyhow::Result<HttpsConfig> {
+    pub fn https_config(&self) -> Result<HttpsConfig, ConfigError> {
         match self.https_mode {
             HttpsMode::Off => Ok(HttpsConfig::Off),
             HttpsMode::CertFiles => {
                 let cert_path = self
                     .tls_cert_path
                     .as_ref()
-                    .context("--tls-cert-path is required when --https-mode=cert-files")?;
+                    .ok_or(ConfigError::MissingTlsCertPath)?;
                 let key_path = self
                     .tls_key_path
                     .as_ref()
-                    .context("--tls-key-path is required when --https-mode=cert-files")?;
+                    .ok_or(ConfigError::MissingTlsKeyPath)?;
                 if !cert_path.exists() {
-                    bail!(
-                        "TLS certificate file does not exist: {}",
-                        cert_path.display()
-                    );
+                    return Err(ConfigError::MissingTlsCertFile {
+                        path: cert_path.clone(),
+                    });
                 }
                 if !key_path.exists() {
-                    bail!(
-                        "TLS private key file does not exist: {}",
-                        key_path.display()
-                    );
+                    return Err(ConfigError::MissingTlsKeyFile {
+                        path: key_path.clone(),
+                    });
                 }
                 Ok(HttpsConfig::CertFiles {
                     cert_path: cert_path.clone(),
@@ -148,26 +147,22 @@ impl Config {
                 let identifier = self
                     .acme_identifier
                     .as_deref()
-                    .context("--acme-identifier is required when --https-mode=acme-http-01")?;
+                    .ok_or(ConfigError::MissingAcmeIdentifier)?;
                 if identifier.trim().is_empty() {
-                    bail!("--acme-identifier must not be empty");
+                    return Err(ConfigError::EmptyAcmeIdentifier);
                 }
                 let email = self
                     .acme_email
                     .as_deref()
-                    .context("--acme-email is required when --https-mode=acme-http-01")?;
+                    .ok_or(ConfigError::MissingAcmeEmail)?;
                 if email.trim().is_empty() {
-                    bail!("--acme-email must not be empty");
+                    return Err(ConfigError::EmptyAcmeEmail);
                 }
                 if self.bind_addr == self.acme_http_bind_addr {
-                    bail!("--bind-addr and --acme-http-bind-addr must be different");
+                    return Err(ConfigError::DuplicateAcmeAndServiceListener);
                 }
                 if self.acme_http_bind_addr.port() != 80 && !self.acme_allow_nonstandard_http_port {
-                    bail!(
-                        "--acme-http-bind-addr must listen on port 80 for HTTP-01; \
-                         set --acme-allow-nonstandard-http-port only for local ACME \
-                         tests or explicit public-port forwarding"
-                    );
+                    return Err(ConfigError::NonstandardAcmeHttpPort);
                 }
                 Ok(HttpsConfig::AcmeHttp01(AcmeHttp01Config {
                     identifier: identifier.trim().to_string(),

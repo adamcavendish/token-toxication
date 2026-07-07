@@ -1,6 +1,5 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::Context;
 use axum::Router;
 use axum_server::{Handle, tls_rustls::RustlsConfig};
 use tokio::{net::TcpListener, sync::watch};
@@ -8,13 +7,14 @@ use tokio::{net::TcpListener, sync::watch};
 use crate::{
     acme::{AcmeManager, ChallengeStore, http01_router},
     config::{AcmeHttp01Config, Config, HttpsConfig},
+    error::ServerError,
 };
 
 pub async fn serve(
     config: Arc<Config>,
     https_config: HttpsConfig,
     app: Router,
-) -> anyhow::Result<()> {
+) -> Result<(), ServerError> {
     match https_config {
         HttpsConfig::Off => serve_http(config, app).await,
         HttpsConfig::CertFiles {
@@ -25,10 +25,13 @@ pub async fn serve(
     }
 }
 
-async fn serve_http(config: Arc<Config>, app: Router) -> anyhow::Result<()> {
+async fn serve_http(config: Arc<Config>, app: Router) -> Result<(), ServerError> {
     let listener = TcpListener::bind(config.bind_addr)
         .await
-        .with_context(|| format!("bind HTTP listener at {}", config.bind_addr))?;
+        .map_err(|source| ServerError::BindHttp {
+            addr: config.bind_addr,
+            source,
+        })?;
     tracing::info!("listening on http://{}", config.bind_addr);
     axum::serve(
         listener,
@@ -36,7 +39,7 @@ async fn serve_http(config: Arc<Config>, app: Router) -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await
-    .context("serve HTTP listener")?;
+    .map_err(|source| ServerError::ServeHttp { source })?;
     Ok(())
 }
 
@@ -45,15 +48,13 @@ async fn serve_cert_files(
     cert_path: PathBuf,
     key_path: PathBuf,
     app: Router,
-) -> anyhow::Result<()> {
+) -> Result<(), ServerError> {
     let tls_config = RustlsConfig::from_pem_file(&cert_path, &key_path)
         .await
-        .with_context(|| {
-            format!(
-                "load TLS certificate {} and key {}",
-                cert_path.display(),
-                key_path.display()
-            )
+        .map_err(|source| ServerError::LoadTlsCertificate {
+            cert_path: cert_path.clone(),
+            key_path: key_path.clone(),
+            source,
         })?;
     serve_rustls(config.bind_addr, tls_config, app).await
 }
@@ -62,18 +63,16 @@ async fn serve_acme_http01(
     config: Arc<Config>,
     acme_config: AcmeHttp01Config,
     app: Router,
-) -> anyhow::Result<()> {
+) -> Result<(), ServerError> {
     let (shutdown_tx, shutdown_rx) = shutdown_channel();
     let acme_config = Arc::new(acme_config);
     let challenge_store = ChallengeStore::default();
     let http01_app = http01_router(challenge_store.clone());
     let http01_listener = TcpListener::bind(acme_config.http_bind_addr)
         .await
-        .with_context(|| {
-            format!(
-                "bind ACME HTTP-01 listener at {}",
-                acme_config.http_bind_addr
-            )
+        .map_err(|source| ServerError::BindAcmeHttp01 {
+            addr: acme_config.http_bind_addr,
+            source,
         })?;
     tracing::info!(
         "listening for ACME HTTP-01 challenges on http://{}",
@@ -89,24 +88,22 @@ async fn serve_acme_http01(
         .await
     });
 
-    let acme_http = build_http_client().context("build ACME HTTP client")?;
+    let acme_http = build_http_client()?;
     let manager = AcmeManager::new(acme_config, challenge_store, acme_http);
     let certificate = match manager.prepare_certificate().await {
         Ok(certificate) => certificate,
         Err(error) => {
             let _ = shutdown_tx.send(true);
             let _ = http01_task.await;
-            return Err(error);
+            return Err(ServerError::Acme(error));
         }
     };
     let tls_config = RustlsConfig::from_pem_file(&certificate.cert_path, &certificate.key_path)
         .await
-        .with_context(|| {
-            format!(
-                "load ACME certificate {} and key {}",
-                certificate.cert_path.display(),
-                certificate.key_path.display()
-            )
+        .map_err(|source| ServerError::LoadTlsCertificate {
+            cert_path: certificate.cert_path.clone(),
+            key_path: certificate.key_path.clone(),
+            source,
         })?;
     let renewal_task = manager
         .clone()
@@ -122,17 +119,23 @@ async fn serve_acme_http01(
     tokio::select! {
         result = &mut http01_task => {
             let _ = shutdown_tx.send(true);
-            let https_result = (&mut https_task).await.context("join HTTPS task")?;
+            let https_result = (&mut https_task)
+                .await
+                .map_err(|source| ServerError::JoinHttps { source })?;
             renewal_task.abort();
-            result.context("join ACME HTTP-01 task")?.context("serve ACME HTTP-01 listener")?;
+            result
+                .map_err(|source| ServerError::JoinAcmeHttp01 { source })?
+                .map_err(|source| ServerError::ServeAcmeHttp01 { source })?;
             https_result
         }
         result = &mut https_task => {
             let _ = shutdown_tx.send(true);
-            let http01_result = (&mut http01_task).await.context("join ACME HTTP-01 task")?;
+            let http01_result = (&mut http01_task)
+                .await
+                .map_err(|source| ServerError::JoinAcmeHttp01 { source })?;
             renewal_task.abort();
-            http01_result.context("serve ACME HTTP-01 listener")?;
-            result.context("join HTTPS task")?
+            http01_result.map_err(|source| ServerError::ServeAcmeHttp01 { source })?;
+            result.map_err(|source| ServerError::JoinHttps { source })?
         }
     }
 }
@@ -141,7 +144,7 @@ async fn serve_rustls(
     bind_addr: SocketAddr,
     tls_config: RustlsConfig,
     app: Router,
-) -> anyhow::Result<()> {
+) -> Result<(), ServerError> {
     let (_shutdown_tx, shutdown_rx) = shutdown_channel();
     serve_rustls_with_shutdown(bind_addr, tls_config, app, shutdown_rx).await
 }
@@ -151,7 +154,7 @@ async fn serve_rustls_with_shutdown(
     tls_config: RustlsConfig,
     app: Router,
     shutdown_rx: watch::Receiver<bool>,
-) -> anyhow::Result<()> {
+) -> Result<(), ServerError> {
     let handle = Handle::new();
     let shutdown_handle = handle.clone();
     tokio::spawn(async move {
@@ -164,17 +167,17 @@ async fn serve_rustls_with_shutdown(
         .handle(handle)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
-        .context("serve HTTPS listener")?;
+        .map_err(|source| ServerError::ServeHttps { source })?;
     Ok(())
 }
 
-fn build_http_client() -> anyhow::Result<aioduct::TokioClient> {
+fn build_http_client() -> Result<aioduct::TokioClient, ServerError> {
     aioduct::TokioClient::builder()
         .tls(aioduct::tls::RustlsConnector::with_webpki_roots())
         .user_agent("token-toxication-acme/0.1")
         .timeout(Duration::from_secs(120))
         .build()
-        .context("build aioduct HTTP client")
+        .map_err(|source| ServerError::BuildAcmeHttpClient { source })
 }
 
 fn shutdown_channel() -> (watch::Sender<bool>, watch::Receiver<bool>) {

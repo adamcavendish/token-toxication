@@ -10,14 +10,12 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/adamcavendish/token-toxication"
 
 [workspace.dependencies]
-anyhow = "1"
 aioduct = { version = "0.2.0", features = ["tokio", "rustls", "rustls-ring"] }
 axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
-dotenvy = "0.15"
 futures-util = "0.3"
 hex = "0.4"
 http-body-util = "0.1"

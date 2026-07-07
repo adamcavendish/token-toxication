@@ -42,7 +42,7 @@ pub struct Db {
 }
 
 impl Db {
-    pub async fn open(path: &Path) -> rusqlite::Result<Self> {
+    pub async fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
@@ -199,7 +199,7 @@ impl Db {
         token: &str,
         username: &str,
         expires_at: DateTime<Utc>,
-    ) -> rusqlite::Result<()> {
+    ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO admin_sessions (token_hash, username, expires_at, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -212,7 +212,7 @@ impl Db {
         &self,
         token: &str,
         now: DateTime<Utc>,
-    ) -> rusqlite::Result<Option<String>> {
+    ) -> Result<Option<String>, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let record = conn
             .query_row(
@@ -236,7 +236,7 @@ impl Db {
         Ok(Some(username))
     }
 
-    pub async fn delete_admin_session(&self, token: &str) -> rusqlite::Result<()> {
+    pub async fn delete_admin_session(&self, token: &str) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().await;
         conn.execute(
             "DELETE FROM admin_sessions WHERE token_hash = ?1",
@@ -249,7 +249,7 @@ impl Db {
         &self,
         input: CreateApiKeyRequest,
         secret: &str,
-    ) -> rusqlite::Result<ApiKeyView> {
+    ) -> Result<ApiKeyView, rusqlite::Error> {
         let now = Utc::now();
         let key = ApiKeyView {
             id: Uuid::new_v4().to_string(),
@@ -291,7 +291,7 @@ impl Db {
         Ok(key)
     }
 
-    pub async fn list_api_keys(&self) -> rusqlite::Result<Vec<ApiKeyView>> {
+    pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyView>, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT id, name, description, key_hash, key_preview, is_active, permissions,
@@ -303,7 +303,10 @@ impl Db {
         rows_to_api_keys(&mut stmt, params![])
     }
 
-    pub async fn validate_api_key(&self, secret: &str) -> rusqlite::Result<Option<ApiKeyRecord>> {
+    pub async fn validate_api_key(
+        &self,
+        secret: &str,
+    ) -> Result<Option<ApiKeyRecord>, rusqlite::Error> {
         let hash = hash_secret(secret);
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
@@ -339,7 +342,7 @@ impl Db {
         &self,
         id: &str,
         input: UpdateApiKeyRequest,
-    ) -> rusqlite::Result<ApiKeyView> {
+    ) -> Result<ApiKeyView, rusqlite::Error> {
         let current = self
             .get_api_key(id)
             .await?
@@ -380,13 +383,13 @@ impl Db {
         Ok(updated)
     }
 
-    pub async fn delete_api_key(&self, id: &str) -> rusqlite::Result<bool> {
+    pub async fn delete_api_key(&self, id: &str) -> Result<bool, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let deleted = conn.execute("DELETE FROM api_keys WHERE id = ?1", params![id])?;
         Ok(deleted > 0)
     }
 
-    pub async fn get_api_key(&self, id: &str) -> rusqlite::Result<Option<ApiKeyView>> {
+    pub async fn get_api_key(&self, id: &str) -> Result<Option<ApiKeyView>, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT id, name, description, key_hash, key_preview, is_active, permissions,
@@ -402,7 +405,7 @@ impl Db {
     pub async fn create_provider_account(
         &self,
         input: CreateProviderAccountRequest,
-    ) -> rusqlite::Result<ProviderAccount> {
+    ) -> Result<ProviderAccount, rusqlite::Error> {
         let now = Utc::now();
         let provider = normalize_provider(&input.provider);
         let account = ProviderAccount {
@@ -443,7 +446,7 @@ impl Db {
         Ok(account)
     }
 
-    pub async fn list_provider_accounts(&self) -> rusqlite::Result<Vec<ProviderAccount>> {
+    pub async fn list_provider_accounts(&self) -> Result<Vec<ProviderAccount>, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT id, name, provider, base_url, auth_mode, wire_api, api_key, is_active,
@@ -454,7 +457,7 @@ impl Db {
         rows_to_accounts(&mut stmt, params![])
     }
 
-    pub async fn list_model_catalog(&self) -> rusqlite::Result<Vec<ModelCatalogEntry>> {
+    pub async fn list_model_catalog(&self) -> Result<Vec<ModelCatalogEntry>, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT id, display_name, family, enabled, created_at
@@ -468,7 +471,7 @@ impl Db {
     pub async fn create_model_catalog_entry(
         &self,
         input: CreateModelCatalogEntryRequest,
-    ) -> rusqlite::Result<ModelCatalogEntry> {
+    ) -> Result<ModelCatalogEntry, rusqlite::Error> {
         let now = Utc::now();
         let id = input.id.trim().to_string();
         let display_name = default_display_name(input.display_name, &id);
@@ -498,7 +501,7 @@ impl Db {
         &self,
         id: &str,
         input: UpdateModelCatalogEntryRequest,
-    ) -> rusqlite::Result<ModelCatalogEntry> {
+    ) -> Result<ModelCatalogEntry, rusqlite::Error> {
         let current = self
             .get_model_catalog_entry(id)
             .await?
@@ -534,7 +537,7 @@ impl Db {
     pub async fn get_model_catalog_entry(
         &self,
         id: &str,
-    ) -> rusqlite::Result<Option<ModelCatalogEntry>> {
+    ) -> Result<Option<ModelCatalogEntry>, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT id, display_name, family, enabled, created_at
@@ -545,7 +548,9 @@ impl Db {
             .optional()
     }
 
-    pub async fn list_provider_model_routes(&self) -> rusqlite::Result<Vec<ProviderModelRoute>> {
+    pub async fn list_provider_model_routes(
+        &self,
+    ) -> Result<Vec<ProviderModelRoute>, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT id, public_model_id, provider_account_id, upstream_model_id, wire_api,
@@ -563,7 +568,7 @@ impl Db {
     pub async fn create_provider_model_route(
         &self,
         input: CreateProviderModelRouteRequest,
-    ) -> rusqlite::Result<ProviderModelRoute> {
+    ) -> Result<ProviderModelRoute, rusqlite::Error> {
         let now = Utc::now();
         let route = ProviderModelRoute {
             id: Uuid::new_v4().to_string(),
@@ -607,7 +612,7 @@ impl Db {
         &self,
         id: &str,
         input: UpdateProviderModelRouteRequest,
-    ) -> rusqlite::Result<ProviderModelRoute> {
+    ) -> Result<ProviderModelRoute, rusqlite::Error> {
         let current = self
             .get_provider_model_route(id)
             .await?
@@ -669,7 +674,7 @@ impl Db {
     pub async fn get_provider_model_route(
         &self,
         id: &str,
-    ) -> rusqlite::Result<Option<ProviderModelRoute>> {
+    ) -> Result<Option<ProviderModelRoute>, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT id, public_model_id, provider_account_id, upstream_model_id, wire_api,
@@ -682,7 +687,7 @@ impl Db {
             .optional()
     }
 
-    pub async fn delete_provider_model_route(&self, id: &str) -> rusqlite::Result<bool> {
+    pub async fn delete_provider_model_route(&self, id: &str) -> Result<bool, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let deleted = conn.execute(
             "DELETE FROM provider_model_routes WHERE id = ?1",
@@ -694,7 +699,7 @@ impl Db {
     pub async fn list_routable_model_catalog(
         &self,
         wire_apis: &[&str],
-    ) -> rusqlite::Result<Vec<RoutableModelCatalogEntry>> {
+    ) -> Result<Vec<RoutableModelCatalogEntry>, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let now = Utc::now().to_rfc3339();
         let mut stmt = conn.prepare(
@@ -742,7 +747,7 @@ impl Db {
     pub async fn select_provider_account(
         &self,
         model: Option<&str>,
-    ) -> rusqlite::Result<Option<ProviderRouteSelection>> {
+    ) -> Result<Option<ProviderRouteSelection>, rusqlite::Error> {
         self.select_provider_account_for_wire("anthropic-messages", model)
             .await
     }
@@ -751,7 +756,7 @@ impl Db {
         &self,
         wire_api: &str,
         model: Option<&str>,
-    ) -> rusqlite::Result<Option<ProviderRouteSelection>> {
+    ) -> Result<Option<ProviderRouteSelection>, rusqlite::Error> {
         let Some(model) = model else {
             return Ok(None);
         };
@@ -787,7 +792,7 @@ impl Db {
         &self,
         id: &str,
         input: UpdateProviderAccountRequest,
-    ) -> rusqlite::Result<ProviderAccount> {
+    ) -> Result<ProviderAccount, rusqlite::Error> {
         let current = self
             .get_provider_account(id)
             .await?
@@ -862,7 +867,7 @@ impl Db {
     pub async fn get_provider_account(
         &self,
         id: &str,
-    ) -> rusqlite::Result<Option<ProviderAccount>> {
+    ) -> Result<Option<ProviderAccount>, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT id, name, provider, base_url, auth_mode, wire_api, api_key, is_active,
@@ -878,7 +883,7 @@ impl Db {
         &self,
         id: &str,
         api_key: &str,
-    ) -> rusqlite::Result<()> {
+    ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE provider_accounts SET api_key = ?1 WHERE id = ?2",
@@ -887,7 +892,7 @@ impl Db {
         Ok(())
     }
 
-    pub async fn delete_provider_account(&self, id: &str) -> rusqlite::Result<()> {
+    pub async fn delete_provider_account(&self, id: &str) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().await;
         conn.execute("DELETE FROM provider_accounts WHERE id = ?1", params![id])?;
         Ok(())
@@ -898,7 +903,7 @@ impl Db {
         id: &str,
         status: &str,
         error: Option<&str>,
-    ) -> rusqlite::Result<()> {
+    ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE provider_accounts SET status = ?1, last_error = ?2, last_used_at = ?3 WHERE id = ?4",
@@ -907,7 +912,11 @@ impl Db {
         Ok(())
     }
 
-    pub async fn mark_route_success(&self, id: &str, status_code: u16) -> rusqlite::Result<()> {
+    pub async fn mark_route_success(
+        &self,
+        id: &str,
+        status_code: u16,
+    ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE provider_model_routes
@@ -929,7 +938,7 @@ impl Db {
         last_status_code: Option<u16>,
         error: &str,
         cooldown_until: Option<DateTime<Utc>>,
-    ) -> rusqlite::Result<()> {
+    ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE provider_model_routes
@@ -951,7 +960,7 @@ impl Db {
         Ok(())
     }
 
-    pub async fn insert_request_log(&self, log: RequestLog) -> rusqlite::Result<()> {
+    pub async fn insert_request_log(&self, log: RequestLog) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO request_logs
@@ -985,7 +994,7 @@ impl Db {
         Ok(())
     }
 
-    pub async fn list_request_logs(&self, limit: u32) -> rusqlite::Result<Vec<RequestLog>> {
+    pub async fn list_request_logs(&self, limit: u32) -> Result<Vec<RequestLog>, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT id, api_key_id, provider_account_id, method, path, model, upstream_model,
@@ -999,7 +1008,7 @@ impl Db {
         rows.collect()
     }
 
-    pub async fn dashboard(&self) -> rusqlite::Result<Dashboard> {
+    pub async fn dashboard(&self) -> Result<Dashboard, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let total_api_keys = count(&conn, "SELECT COUNT(*) FROM api_keys")?;
         let active_api_keys = count(&conn, "SELECT COUNT(*) FROM api_keys WHERE is_active = 1")?;
@@ -1027,7 +1036,7 @@ impl Db {
 fn rows_to_api_keys<P>(
     stmt: &mut rusqlite::Statement<'_>,
     params: P,
-) -> rusqlite::Result<Vec<ApiKeyView>>
+) -> Result<Vec<ApiKeyView>, rusqlite::Error>
 where
     P: rusqlite::Params,
 {
@@ -1040,7 +1049,7 @@ fn ensure_column(
     table_name: &str,
     column_name: &str,
     column_definition: &str,
-) -> rusqlite::Result<()> {
+) -> Result<(), rusqlite::Error> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table_name})"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -1059,7 +1068,7 @@ fn ensure_column(
 fn rows_to_accounts<P>(
     stmt: &mut rusqlite::Statement<'_>,
     params: P,
-) -> rusqlite::Result<Vec<ProviderAccount>>
+) -> Result<Vec<ProviderAccount>, rusqlite::Error>
 where
     P: rusqlite::Params,
 {
@@ -1067,7 +1076,7 @@ where
     rows.map(|row| row.map(|record| record.account)).collect()
 }
 
-fn api_key_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKeyRecord> {
+fn api_key_from_row(row: &rusqlite::Row<'_>) -> Result<ApiKeyRecord, rusqlite::Error> {
     let permissions: String = row.get(6)?;
     Ok(ApiKeyRecord {
         view: ApiKeyView {
@@ -1088,7 +1097,7 @@ fn api_key_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKeyRecord> {
     })
 }
 
-fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderAccountRecord> {
+fn account_from_row(row: &rusqlite::Row<'_>) -> Result<ProviderAccountRecord, rusqlite::Error> {
     Ok(ProviderAccountRecord {
         account: ProviderAccount {
             id: row.get(0)?,
@@ -1108,7 +1117,7 @@ fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderAccount
     })
 }
 
-fn model_catalog_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelCatalogEntry> {
+fn model_catalog_from_row(row: &rusqlite::Row<'_>) -> Result<ModelCatalogEntry, rusqlite::Error> {
     Ok(ModelCatalogEntry {
         id: row.get(0)?,
         display_name: row.get(1)?,
@@ -1118,7 +1127,9 @@ fn model_catalog_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelCata
     })
 }
 
-fn provider_model_route_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderModelRoute> {
+fn provider_model_route_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<ProviderModelRoute, rusqlite::Error> {
     let strip_params: String = row.get(12)?;
     Ok(ProviderModelRoute {
         id: row.get(0)?,
@@ -1138,7 +1149,9 @@ fn provider_model_route_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pr
     })
 }
 
-fn route_selection_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRouteSelection> {
+fn route_selection_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<ProviderRouteSelection, rusqlite::Error> {
     let strip_params: String = row.get(16)?;
     Ok(ProviderRouteSelection {
         account: account_from_row(row)?,
@@ -1149,7 +1162,7 @@ fn route_selection_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provide
     })
 }
 
-fn request_log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLog> {
+fn request_log_from_row(row: &rusqlite::Row<'_>) -> Result<RequestLog, rusqlite::Error> {
     let request_summary: Option<String> = row.get(8)?;
     Ok(RequestLog {
         id: row.get(0)?,
@@ -1173,12 +1186,12 @@ fn request_log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLog>
     })
 }
 
-fn count(conn: &Connection, sql: &str) -> rusqlite::Result<u64> {
+fn count(conn: &Connection, sql: &str) -> Result<u64, rusqlite::Error> {
     conn.query_row(sql, [], |row| row.get::<_, i64>(0))
         .map(|value| value as u64)
 }
 
-fn usage_summary(conn: &Connection, today: NaiveDate) -> rusqlite::Result<UsageSummary> {
+fn usage_summary(conn: &Connection, today: NaiveDate) -> Result<UsageSummary, rusqlite::Error> {
     let prefix = today.to_string();
     let (requests_today, tokens_today, estimated_cost_today) = conn.query_row(
         "SELECT COUNT(*), COALESCE(SUM(input_tokens + output_tokens), 0), COALESCE(SUM(cost_usd), 0)
