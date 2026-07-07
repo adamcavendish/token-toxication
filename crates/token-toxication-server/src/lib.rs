@@ -1,3 +1,4 @@
+pub mod acme;
 pub mod auth;
 pub mod codex_subscription;
 pub mod config;
@@ -8,6 +9,7 @@ pub mod openapi;
 pub mod provider_catalog;
 pub mod routes;
 pub mod routing;
+pub mod server;
 pub mod static_assets;
 
 use std::{path::PathBuf, sync::Arc};

@@ -1,10 +1,9 @@
-use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use token_toxication_server::{AppState, app, config::Config, db::Db};
-use tokio::net::TcpListener;
+use token_toxication_server::{AppState, app, config::Config, db::Db, server};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa::OpenApi as _;
 
@@ -48,6 +47,7 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    let https_config = config.https_config()?;
     config.warn_if_default_admin_password();
     let config = Arc::new(config);
     let db = Db::open(&config.database_path)
@@ -68,16 +68,7 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
     };
 
     let app = app(state, config.static_dir.clone());
-    let listener = TcpListener::bind(config.bind_addr).await?;
-    tracing::info!("listening on http://{}", config.bind_addr);
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
-
-    Ok(())
+    server::serve(config, https_config, app).await
 }
 
 fn generate_openapi(output: PathBuf) -> anyhow::Result<()> {
@@ -91,28 +82,4 @@ fn generate_openapi(output: PathBuf) -> anyhow::Result<()> {
     fs::write(&output, json).with_context(|| format!("write {}", output.display()))?;
     println!("wrote {}", output.display());
     Ok(())
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => {},
-        () = terminate => {},
-    }
 }

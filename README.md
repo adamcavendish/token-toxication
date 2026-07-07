@@ -146,6 +146,53 @@ Tracing reads the conventional `RUST_LOG` environment variable and falls back to
 an info-level server filter. Provider account API keys are stored in the local
 SQLite database, so keep `data/` private.
 
+The main listener is always configured with `--bind-addr`. By default it serves
+plain HTTP. To make the single server binary terminate TLS itself, set
+`--https-mode`:
+
+- `off` serves plain HTTP on `--bind-addr`.
+- `cert-files` serves HTTPS on `--bind-addr` from `--tls-cert-path` and
+  `--tls-key-path`.
+- `acme-http-01` serves HTTPS on `--bind-addr` with app-managed ACME
+  certificates and uses `--acme-http-bind-addr` for HTTP-01 challenges.
+
+```bash
+token-toxication-server \
+  --bind-addr 0.0.0.0:443 \
+  --https-mode cert-files \
+  --tls-cert-path /etc/token-toxication/fullchain.pem \
+  --tls-key-path /etc/token-toxication/privkey.pem
+```
+
+```bash
+token-toxication-server \
+  --bind-addr 0.0.0.0:443 \
+  --https-mode acme-http-01 \
+  --acme-identifier 91.216.169.227 \
+  --acme-email ops@example.com \
+  --acme-http-bind-addr 0.0.0.0:80 \
+  --acme-cert-dir /var/lib/token-toxication/acme
+```
+
+`acme-http-01` accepts either a domain name or a public IP address. IP address
+certificates automatically request the ACME `shortlived` profile and are renewed
+aggressively because they are valid for only about 160 hours. The ACME account,
+certificate chain, private key, and metadata are stored under `--acme-cert-dir`;
+they are never stored in SQLite.
+
+HTTP-01 validation expects the challenge listener to be reachable on public port
+80. Token Toxication enforces that by default. Use
+`--acme-allow-nonstandard-http-port` only for local ACME test servers or when an
+explicit public-port forwarding layer maps port 80 to another local port.
+
+When running under systemd as a non-root user on ports 80 or 443, grant only the
+low-port bind capability:
+
+```ini
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+```
+
 ## OpenAPI and SDK Generation
 
 The backend emits the ignored `openapi/token-toxication.openapi.json` with
