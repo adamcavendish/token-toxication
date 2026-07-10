@@ -1,9 +1,11 @@
 pub mod acme;
+pub mod antigravity_oauth;
 pub mod auth;
 pub mod codex_subscription;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod gemini_code_assist;
 pub mod models;
 pub mod openapi;
 pub mod provider_catalog;
@@ -19,8 +21,10 @@ use chrono::{DateTime, Utc};
 use config::Config;
 use db::Db;
 use routes::{
-    admin_routes, get_anthropic_model, get_openai_model, health, list_anthropic_models,
-    list_openai_models, metrics, relay_messages, relay_openai_chat, relay_openai_responses,
+    admin_routes, antigravity_oauth_callback, get_anthropic_model, get_gemini_model,
+    get_openai_model, health, list_anthropic_models, list_gemini_models, list_openai_models,
+    metrics, relay_gemini_generate_content, relay_messages, relay_openai_chat,
+    relay_openai_responses,
 };
 use tower_http::{
     cors::CorsLayer,
@@ -33,6 +37,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub db: Db,
     pub http: aioduct::TokioClient,
+    pub gemini_http: aioduct::TokioClient,
+    pub antigravity_oauth: antigravity_oauth::AntigravityOAuthStore,
     pub started_at: DateTime<Utc>,
 }
 
@@ -43,6 +49,10 @@ pub fn app(state: AppState, static_dir: PathBuf) -> Router {
         .route("/health", axum::routing::get(health))
         .route("/metrics", axum::routing::get(metrics))
         .route("/openapi.json", axum::routing::get(openapi::openapi_json))
+        .route(
+            "/oauth-callback",
+            axum::routing::get(antigravity_oauth_callback),
+        )
         .route(
             "/anthropic/v1/messages",
             axum::routing::post(relay_messages),
@@ -67,6 +77,14 @@ pub fn app(state: AppState, static_dir: PathBuf) -> Router {
         .route(
             "/openai/v1/responses",
             axum::routing::post(relay_openai_responses),
+        )
+        .route(
+            "/gemini/v1beta/models",
+            axum::routing::get(list_gemini_models),
+        )
+        .route(
+            "/gemini/v1beta/models/{*operation}",
+            axum::routing::get(get_gemini_model).post(relay_gemini_generate_content),
         )
         .nest("/admin/api", admin_routes(state.clone()));
 

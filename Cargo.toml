@@ -35,4 +35,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 utoipa = { version = "5.5.0", features = ["chrono"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+url = "2"
 x509-parser = "0.18"

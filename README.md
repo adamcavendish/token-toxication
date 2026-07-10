@@ -1,9 +1,9 @@
 # Token Toxication
 
 Token Toxication is a Rust + React relay service. It provides self-hosted
-Anthropic Messages, OpenAI Responses, and OpenAI Chat relay endpoints,
-admin-managed API keys, provider account rotation, request logging, and a Vite+
-shadcn dashboard.
+Anthropic Messages, OpenAI Responses, OpenAI Chat, and Gemini GenerateContent
+relay endpoints, admin-managed API keys, provider account rotation, request
+logging, and a Vite+ shadcn dashboard.
 
 ## Layout
 
@@ -52,11 +52,27 @@ curl http://localhost:3000/openai/v1/responses \
   -d '{"model":"gpt-5","input":"hello"}'
 ```
 
+Gemini native GenerateContent relay through a Gemini account:
+
+```bash
+curl http://localhost:3000/gemini/v1beta/models/gemini-3.1-pro-high:generateContent \
+  -H "Authorization: Bearer tokentoxication-..." \
+  -H "content-type: application/json" \
+  -d '{"contents":[{"parts":[{"text":"hello"}]}]}'
+```
+
 Model discovery uses the same relay API key authentication. Concrete model names
 come from enabled catalog entries with at least one active provider model route:
 
 ```bash
 curl http://localhost:3000/openai/v1/models \
+  -H "Authorization: Bearer tokentoxication-..."
+```
+
+Gemini native model discovery is also available:
+
+```bash
+curl http://localhost:3000/gemini/v1beta/models \
   -H "Authorization: Bearer tokentoxication-..."
 ```
 
@@ -67,6 +83,12 @@ Each provider account has a `wire_api` protocol:
 - `anthropic-messages` forwards to `{base_url}/v1/messages`.
 - `openai-chat` forwards to `{base_url}/chat/completions`.
 - `openai-responses` forwards to `{base_url}/v1/responses`.
+- `gemini-generate-content` forwards to
+  `{base_url}/v1internal:generateContent` and
+  `{base_url}/v1internal:streamGenerateContent?alt=sse` using a refreshed
+  Gemini account OAuth bearer token. The upstream model ID is sent in the Code
+  Assist request body. Antigravity OAuth accounts use the native agent request
+  envelope and Antigravity user agent expected by this backend.
 
 For Anthropic-compatible clients, use base URL `http://localhost:3000/anthropic`.
 
@@ -78,7 +100,7 @@ provider account plus exact upstream model name.
 Provider presets are served by the backend at `/admin/api/provider-presets` and
 are loaded by the admin UI. The same backend catalog also normalizes provider
 aliases such as Kimi, Moonshot, Z.AI, Zhipu, MiniMax token-plan, DeepSeek v4,
-and Qwen/DashScope names.
+Qwen/DashScope, and Gemini/Google AI names.
 
 For OpenAI-compatible chat providers such as DeepSeek, Qwen, Kimi, Moonshot AI,
 Z.AI, and Zhipu AI, create provider accounts with `openai-chat`, add catalog
@@ -91,6 +113,36 @@ opencode. Add them with `anthropic-messages` and base URLs such as
 `https://api.minimax.io/anthropic/v1` or
 `https://api.minimaxi.com/anthropic/v1`, then add exact catalog models such as
 `MiniMax-M3` or `MiniMax-M2.7`.
+
+For Gemini native GenerateContent, set
+`TT_ANTIGRAVITY_OAUTH_CLIENT_SECRET` on the backend, then choose the
+`Antigravity OAuth` provider preset in the admin UI and select **Sign in with
+Antigravity**. The backend starts a PKCE Google OAuth flow, receives the
+loopback `/oauth-callback`, and stores the refresh/access tokens without
+returning them to the browser. Code Assist project discovery runs when the
+account is first used. The public Antigravity client ID is built in and can be
+overridden with
+`TT_ANTIGRAVITY_OAUTH_CLIENT_ID`. Antigravity OAuth is the only supported
+account OAuth mode for Gemini native relay.
+
+The provider account row exposes account-specific model and quota inspection.
+The backend reads Antigravity models and per-model reset data from
+`fetchAvailableModels`, and reads grouped five-hour and weekly limits from
+`retrieveUserQuotaSummary`; permission failures remain visible separately. The
+corresponding admin endpoints are
+`/admin/api/provider-accounts/{id}/gemini/models` and
+`/admin/api/provider-accounts/{id}/gemini/quota`.
+
+Add catalog entries and routes using the exact model IDs returned for the
+account. The current Antigravity catalog exposes Gemini 3.1 Pro High through
+the callable upstream alias `gemini-pro-agent`, so configure public model
+`gemini-3.1-pro-high` with that `upstreamModelId`. Gemini clients can send
+native `contents`, `generationConfig`,
+`safetySettings`, `tools`, and `toolConfig` bodies to
+`/gemini/v1beta/models/{model}:generateContent` or
+`/gemini/v1beta/models/{model}:streamGenerateContent`. Client relay
+authentication still uses the generated `tokentoxication-...` key, including via
+Gemini-style `x-goog-api-key`; that header is not forwarded to Google.
 
 Provider model routes are exact and case-preserving. If a client sends
 `MiniMax-M3`, Token Toxication looks up that exact catalog model and rewrites the
@@ -130,8 +182,8 @@ clients should use base URL `http://localhost:3000/openai/v1`.
 
 Provider presets mirror opencode IDs where available: `minimax`,
 `minimax-coding-plan`, `kimi-for-coding`, `moonshotai`, `zai`,
-`zai-coding-plan`, `zhipuai`, and `zhipuai-coding-plan`. China-region variants
-are also available for MiniMax and Moonshot.
+`zai-coding-plan`, `zhipuai`, `zhipuai-coding-plan`, and `gemini`.
+China-region variants are also available for MiniMax and Moonshot.
 
 Request logs store sanitized upstream metadata only: the upstream origin and
 path without query parameters, top-level request keys, body byte size, stream

@@ -1,5 +1,7 @@
 import { AdminApi, Configuration, ResponseError } from "./generated/token-toxication";
 import type {
+  AntigravityOAuthStartRequest,
+  AntigravityOAuthStartResponse,
   ApiKey,
   CreateApiKeyRequest,
   CreateApiKeyResponse,
@@ -7,6 +9,8 @@ import type {
   CreateProviderAccountRequest,
   CreateProviderModelRouteRequest,
   Dashboard,
+  GeminiAccountModelsResponse,
+  GeminiAccountQuotaResponse,
   LoginResponse,
   ModelCatalogEntry,
   ProviderAccount,
@@ -146,6 +150,23 @@ export const api = {
 
   async deleteProviderAccount(id: string) {
     await callApi(adminApi.deleteProviderAccountRaw({ id }));
+  },
+
+  async startAntigravityOAuth(
+    payload: AntigravityOAuthStartRequest,
+  ): Promise<AntigravityOAuthStartResponse> {
+    const response = await callApi(adminApi.startAntigravityOauth({ body: payload }));
+    return unwrapResult(response);
+  },
+
+  async geminiAccountModels(id: string): Promise<GeminiAccountModelsResponse> {
+    const response = await callApi(adminApi.getGeminiAccountModels({ id }));
+    return unwrapResult(response);
+  },
+
+  async geminiAccountQuota(id: string): Promise<GeminiAccountQuotaResponse> {
+    const response = await callApi(adminApi.getGeminiAccountQuota({ id }));
+    return unwrapResult(response);
   },
 
   async modelCatalog(): Promise<ModelCatalogEntry[]> {

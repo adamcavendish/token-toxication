@@ -2,10 +2,14 @@ use axum::Json;
 use utoipa::OpenApi;
 
 use crate::models::{
-    AdminUser, AnthropicModel, AnthropicModelListResponse, ApiKeyListResponse, ApiKeyResponse,
-    ApiKeyView, CreateApiKeyRequest, CreateApiKeyResponse, CreateModelCatalogEntryRequest,
+    AdminUser, AnthropicModel, AnthropicModelListResponse, AntigravityOAuthStartRequest,
+    AntigravityOAuthStartResponse, ApiKeyListResponse, ApiKeyResponse, ApiKeyView,
+    CreateApiKeyRequest, CreateApiKeyResponse, CreateModelCatalogEntryRequest,
     CreateProviderAccountRequest, CreateProviderModelRouteRequest, Dashboard, ErrorDetail,
-    ErrorResponse, HealthResponse, LoginRequest, LoginResponse, MetricsResponse, ModelCatalogEntry,
+    ErrorResponse, GeminiAccountModel, GeminiAccountModelsResponse, GeminiAccountQuota,
+    GeminiAccountQuotaBucket, GeminiAccountQuotaGroup, GeminiAccountQuotaResponse,
+    GeminiAccountQuotaSummary, GeminiAccountTier, GeminiModel, GeminiModelListResponse,
+    HealthResponse, LoginRequest, LoginResponse, MetricsResponse, ModelCatalogEntry,
     ModelCatalogEntryResponse, ModelCatalogListResponse, OpenAiModel, OpenAiModelListResponse,
     ProviderAccount, ProviderAccountListResponse, ProviderAccountResponse, ProviderModelRoute,
     ProviderModelRouteListResponse, ProviderModelRouteResponse, ProviderPreset,
@@ -38,6 +42,10 @@ use crate::models::{
         create_provider_account,
         update_provider_account,
         delete_provider_account,
+        start_antigravity_oauth,
+        antigravity_oauth_callback,
+        get_gemini_account_models,
+        get_gemini_account_quota,
         list_model_catalog,
         create_model_catalog_entry,
         update_model_catalog_entry,
@@ -50,14 +58,20 @@ use crate::models::{
         get_anthropic_model,
         list_openai_models,
         get_openai_model,
+        list_gemini_models,
+        get_gemini_model,
         relay_anthropic_messages,
         relay_openai_chat_completions,
         relay_openai_responses,
+        relay_gemini_generate_content,
+        relay_gemini_stream_generate_content,
     ),
     components(schemas(
         AdminUser,
         AnthropicModel,
         AnthropicModelListResponse,
+        AntigravityOAuthStartRequest,
+        AntigravityOAuthStartResponse,
         ApiKeyListResponse,
         ApiKeyResponse,
         ApiKeyView,
@@ -69,6 +83,16 @@ use crate::models::{
         Dashboard,
         ErrorDetail,
         ErrorResponse,
+        GeminiAccountModel,
+        GeminiAccountModelsResponse,
+        GeminiAccountQuota,
+        GeminiAccountQuotaBucket,
+        GeminiAccountQuotaGroup,
+        GeminiAccountQuotaResponse,
+        GeminiAccountQuotaSummary,
+        GeminiAccountTier,
+        GeminiModel,
+        GeminiModelListResponse,
         HealthResponse,
         LoginRequest,
         LoginResponse,
@@ -259,6 +283,58 @@ pub fn update_provider_account() {}
 pub fn delete_provider_account() {}
 
 #[utoipa::path(
+    post,
+    path = "/admin/api/oauth/antigravity/start",
+    tag = "Admin",
+    request_body = AntigravityOAuthStartRequest,
+    responses(
+        (status = 200, description = "Antigravity authorization URL", body = AntigravityOAuthStartResponse),
+        (status = 400, description = "OAuth is not configured or callback is invalid", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid admin session", body = ErrorResponse),
+    ),
+)]
+pub fn start_antigravity_oauth() {}
+
+#[utoipa::path(
+    get,
+    path = "/oauth-callback",
+    tag = "Admin",
+    params(
+        ("code" = Option<String>, Query, description = "Google authorization code"),
+        ("state" = Option<String>, Query, description = "One-time OAuth state"),
+        ("error" = Option<String>, Query, description = "Google OAuth error"),
+    ),
+    responses((status = 200, description = "OAuth popup completion page", content_type = "text/html")),
+)]
+pub fn antigravity_oauth_callback() {}
+
+#[utoipa::path(
+    get,
+    path = "/admin/api/provider-accounts/{id}/gemini/models",
+    tag = "Admin",
+    params(("id" = String, Path, description = "Gemini provider account id")),
+    responses(
+        (status = 200, description = "Models available to this Google account", body = GeminiAccountModelsResponse),
+        (status = 400, description = "Provider account is not a Gemini account", body = ErrorResponse),
+        (status = 404, description = "Provider account not found", body = ErrorResponse),
+    ),
+)]
+pub fn get_gemini_account_models() {}
+
+#[utoipa::path(
+    get,
+    path = "/admin/api/provider-accounts/{id}/gemini/quota",
+    tag = "Admin",
+    params(("id" = String, Path, description = "Gemini provider account id")),
+    responses(
+        (status = 200, description = "Per-model quota and account tier", body = GeminiAccountQuotaResponse),
+        (status = 400, description = "Provider account is not a Gemini account", body = ErrorResponse),
+        (status = 404, description = "Provider account not found", body = ErrorResponse),
+    ),
+)]
+pub fn get_gemini_account_quota() {}
+
+#[utoipa::path(
     get,
     path = "/admin/api/provider-presets",
     tag = "Admin",
@@ -405,6 +481,30 @@ pub fn list_openai_models() {}
 pub fn get_openai_model() {}
 
 #[utoipa::path(
+    get,
+    path = "/gemini/v1beta/models",
+    tag = "Relay",
+    responses(
+        (status = 200, description = "Configured Gemini native models", body = GeminiModelListResponse),
+        (status = 401, description = "Missing or invalid API key", body = ErrorResponse),
+    ),
+)]
+pub fn list_gemini_models() {}
+
+#[utoipa::path(
+    get,
+    path = "/gemini/v1beta/models/{model}",
+    tag = "Relay",
+    params(("model" = String, Path, description = "Model id")),
+    responses(
+        (status = 200, description = "Configured Gemini native model", body = GeminiModel),
+        (status = 401, description = "Missing or invalid API key", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+    ),
+)]
+pub fn get_gemini_model() {}
+
+#[utoipa::path(
     post,
     path = "/anthropic/v1/messages",
     tag = "Relay",
@@ -457,3 +557,41 @@ pub fn relay_openai_chat_completions() {}
     ),
 )]
 pub fn relay_openai_responses() {}
+
+#[utoipa::path(
+    post,
+    path = "/gemini/v1beta/models/{model}:generateContent",
+    tag = "Relay",
+    params(("model" = String, Path, description = "Model id")),
+    request_body(
+        content = serde_json::Value,
+        content_type = "application/json",
+        description = "Gemini generateContent request body",
+    ),
+    responses(
+        (status = 200, description = "Upstream Gemini generateContent response", body = serde_json::Value),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid API key", body = ErrorResponse),
+        (status = 403, description = "No matching provider account", body = ErrorResponse),
+    ),
+)]
+pub fn relay_gemini_generate_content() {}
+
+#[utoipa::path(
+    post,
+    path = "/gemini/v1beta/models/{model}:streamGenerateContent",
+    tag = "Relay",
+    params(("model" = String, Path, description = "Model id")),
+    request_body(
+        content = serde_json::Value,
+        content_type = "application/json",
+        description = "Gemini streamGenerateContent request body",
+    ),
+    responses(
+        (status = 200, description = "Upstream Gemini streamGenerateContent response", body = serde_json::Value),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid API key", body = ErrorResponse),
+        (status = 403, description = "No matching provider account", body = ErrorResponse),
+    ),
+)]
+pub fn relay_gemini_stream_generate_content() {}
