@@ -879,6 +879,19 @@ impl Db {
             .map(|record| record.map(|record| record.account))
     }
 
+    pub async fn get_provider_account_record(
+        &self,
+        id: &str,
+    ) -> Result<Option<ProviderAccountRecord>, rusqlite::Error> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, provider, base_url, auth_mode, wire_api, api_key, is_active,
+                    priority, status, last_error, created_at, last_used_at
+             FROM provider_accounts WHERE id = ?1",
+        )?;
+        stmt.query_row(params![id], account_from_row).optional()
+    }
+
     pub async fn update_provider_account_secret(
         &self,
         id: &str,
@@ -1242,7 +1255,13 @@ fn normalize_provider(value: &str) -> String {
 fn normalize_auth_mode(value: &str) -> String {
     match value.trim().to_lowercase().as_str() {
         "bearer" | "authorization" => "bearer".to_string(),
+        "x-goog-api-key" | "google-api-key" | "goog-api-key" | "gemini-api-key" => {
+            "x-goog-api-key".to_string()
+        }
         "codex" | "codex-oauth" | "chatgpt" | "chatgpt-oauth" => "codex-oauth".to_string(),
+        "antigravity" | "antigravity-oauth" | "google-antigravity" => {
+            "antigravity-oauth".to_string()
+        }
         _ => "x-api-key".to_string(),
     }
 }
@@ -1254,6 +1273,9 @@ fn normalize_wire_api(value: &str, provider: &str) -> String {
         }
         "openai" | "openai-chat" | "chat" | "chat-completions" => "openai-chat".to_string(),
         "openai-responses" | "responses" | "codex" => "openai-responses".to_string(),
+        "gemini" | "gemini-generate-content" | "generate-content" | "generatecontent" => {
+            "gemini-generate-content".to_string()
+        }
         "" => default_wire_api_for_provider(provider)
             .unwrap_or("anthropic-messages")
             .to_string(),
@@ -1270,6 +1292,8 @@ fn normalize_family(value: &str) -> String {
         "" => "other".to_string(),
         "anthropic" | "claude" => "anthropic".to_string(),
         "openai" | "gpt" | "codex" | "codex-subscription" | "chatgpt" => "openai".to_string(),
+        "google" | "google-ai" | "google-ai-studio" | "gemini" | "gemini-code-assist"
+        | "cloudcode" => "gemini".to_string(),
         "z.ai" | "zai" | "zhipu" | "zhipuai" => "glm".to_string(),
         other => other.to_string(),
     }
@@ -1620,6 +1644,23 @@ mod tests {
         assert_eq!(
             normalize_wire_api("", "codex-subscription"),
             "openai-responses"
+        );
+    }
+
+    #[test]
+    fn gemini_aliases_default_to_generate_content() {
+        for provider in ["gemini", "google", "Google AI", "google-ai-studio"] {
+            assert_eq!(normalize_wire_api("", provider), "gemini-generate-content");
+        }
+        assert_eq!(normalize_provider("Google AI"), "gemini");
+        assert_eq!(normalize_auth_mode("google-api-key"), "x-goog-api-key");
+        assert_eq!(
+            normalize_auth_mode("google-antigravity"),
+            "antigravity-oauth"
+        );
+        assert_eq!(
+            normalize_wire_api("generateContent", "gemini"),
+            "gemini-generate-content"
         );
     }
 

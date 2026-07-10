@@ -5,8 +5,10 @@ import {
   CheckIcon,
   ClipboardCopyIcon,
   DatabaseIcon,
+  GaugeIcon,
   KeyRoundIcon,
   LayoutDashboardIcon,
+  LogInIcon,
   LogOutIcon,
   PlusIcon,
   RefreshCcwIcon,
@@ -22,6 +24,8 @@ import { api, clearStoredToken, getStoredToken, setStoredToken } from "./api";
 import type {
   ApiKey,
   Dashboard,
+  GeminiAccountModelsResponse,
+  GeminiAccountQuotaResponse,
   ModelCatalogEntry,
   ProviderAccount,
   ProviderModelRoute,
@@ -54,6 +58,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
 import {
   Select,
   SelectContent,
@@ -127,6 +132,13 @@ type ProviderRouteForm = {
 type ClientModelOption = {
   id: string;
   displayName: string;
+};
+
+type AntigravityOAuthMessage = {
+  type: "token-toxication:antigravity-oauth";
+  success: boolean;
+  accountId?: string;
+  error?: string;
 };
 
 const views: Array<{
@@ -203,6 +215,11 @@ function App() {
   const [createRouteForm, setCreateRouteForm] = useState<ProviderRouteForm>(emptyRouteForm);
   const [createdSecret, setCreatedSecret] = useState<string | null>(null);
   const [clientSetupApiKey, setClientSetupApiKey] = useState("");
+  const [geminiDetailsAccount, setGeminiDetailsAccount] = useState<ProviderAccount | null>(null);
+  const [geminiModels, setGeminiModels] = useState<GeminiAccountModelsResponse | null>(null);
+  const [geminiQuota, setGeminiQuota] = useState<GeminiAccountQuotaResponse | null>(null);
+  const [isGeminiDetailsLoading, setIsGeminiDetailsLoading] = useState(false);
+  const [geminiDetailsError, setGeminiDetailsError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     if (!getStoredToken()) {
@@ -248,6 +265,28 @@ function App() {
   useEffect(() => {
     void refresh();
   }, [refresh, token]);
+
+  useEffect(() => {
+    function handleOAuthMessage(event: MessageEvent<AntigravityOAuthMessage>) {
+      if (
+        event.origin !== window.location.origin ||
+        event.data?.type !== "token-toxication:antigravity-oauth"
+      ) {
+        return;
+      }
+      if (event.data.success) {
+        setCreateAccountForm(emptyAccountForm);
+        setIsAccountSheetOpen(false);
+        toast.success("Antigravity account connected");
+        void refresh();
+      } else {
+        toast.error(event.data.error || "Antigravity sign-in failed");
+      }
+    }
+
+    window.addEventListener("message", handleOAuthMessage);
+    return () => window.removeEventListener("message", handleOAuthMessage);
+  }, [refresh]);
 
   async function handleLogin(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -298,6 +337,13 @@ function App() {
 
   async function handleCreateAccount(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (isAntigravityAccountAuth(createAccountForm.authMode)) {
+      await launchAntigravityOAuth({
+        name: createAccountForm.name,
+        priority: numberFromInput(createAccountForm.priority),
+      });
+      return;
+    }
     await api.createProviderAccount({
       name: createAccountForm.name,
       provider: createAccountForm.provider,
@@ -312,6 +358,68 @@ function App() {
     setIsAccountSheetOpen(false);
     toast.success("Provider account created");
     await refresh();
+  }
+
+  async function launchAntigravityOAuth({
+    accountId,
+    name,
+    priority,
+  }: {
+    accountId?: string;
+    name: string;
+    priority: number;
+  }) {
+    const popup = window.open(
+      "about:blank",
+      "token-toxication-antigravity-oauth",
+      "popup,width=560,height=720",
+    );
+    if (!popup) {
+      toast.error("Allow popups to sign in with Antigravity");
+      return;
+    }
+    try {
+      const response = await api.startAntigravityOAuth({
+        accountId,
+        name,
+        priority,
+        redirectUri: `${window.location.origin}/oauth-callback`,
+      });
+      popup.location.replace(response.authorizationUrl);
+    } catch (error) {
+      popup.close();
+      toast.error(error instanceof Error ? error.message : "Unable to start Antigravity sign-in");
+    }
+  }
+
+  async function reconnectAntigravityAccount(account: ProviderAccount) {
+    await launchAntigravityOAuth({
+      accountId: account.id,
+      name: account.name,
+      priority: account.priority,
+    });
+  }
+
+  async function inspectGeminiAccount(account: ProviderAccount) {
+    setGeminiDetailsAccount(account);
+    setGeminiModels(null);
+    setGeminiQuota(null);
+    setGeminiDetailsError(null);
+    setIsGeminiDetailsLoading(true);
+    try {
+      const [models, quota] = await Promise.all([
+        api.geminiAccountModels(account.id),
+        api.geminiAccountQuota(account.id),
+      ]);
+      setGeminiModels(models);
+      setGeminiQuota(quota);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to load Gemini account data";
+      setGeminiDetailsError(message);
+      toast.error(message);
+    } finally {
+      setIsGeminiDetailsLoading(false);
+    }
   }
 
   async function handleCreateModel(event: React.FormEvent<HTMLFormElement>) {
@@ -549,6 +657,8 @@ function App() {
                       routes={modelRoutes}
                       onCreate={() => setIsAccountSheetOpen(true)}
                       onToggle={toggleAccount}
+                      onInspectGemini={inspectGeminiAccount}
+                      onReconnectAntigravity={reconnectAntigravityAccount}
                     />
                   ) : null}
                   {view === "models" ? (
@@ -648,6 +758,14 @@ function App() {
           </div>
         </DialogContent>
       </Dialog>
+      <GeminiAccountDialog
+        account={geminiDetailsAccount}
+        models={geminiModels}
+        quota={geminiQuota}
+        loading={isGeminiDetailsLoading}
+        error={geminiDetailsError}
+        onOpenChange={(open) => !open && setGeminiDetailsAccount(null)}
+      />
       <Toaster />
     </TooltipProvider>
   );
@@ -925,11 +1043,15 @@ function AccountsView({
   routes,
   onCreate,
   onToggle,
+  onInspectGemini,
+  onReconnectAntigravity,
 }: {
   accounts: ProviderAccount[];
   routes: ProviderModelRoute[];
   onCreate: () => void;
   onToggle: (account: ProviderAccount) => void;
+  onInspectGemini: (account: ProviderAccount) => void;
+  onReconnectAntigravity: (account: ProviderAccount) => void;
 }) {
   return (
     <Card>
@@ -954,7 +1076,7 @@ function AccountsView({
                 <TableHead>Base URL</TableHead>
                 <TableHead>Routes</TableHead>
                 <TableHead>Status</TableHead>
-                <TableHead className="text-right">Routing</TableHead>
+                <TableHead className="text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -967,14 +1089,48 @@ function AccountsView({
                   <TableCell>{routeCountForAccount(routes, account.id)}</TableCell>
                   <TableCell>{statusBadge(account.status, account.isActive)}</TableCell>
                   <TableCell className="text-right">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() => onToggle(account)}
-                    >
-                      {account.isActive ? "Enabled" : "Disabled"}
-                    </Button>
+                    <div className="flex justify-end gap-2">
+                      {isGeminiAccount(account) ? (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="icon-sm"
+                              aria-label="Models and quota"
+                              onClick={() => onInspectGemini(account)}
+                            >
+                              <GaugeIcon />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Models and quota</TooltipContent>
+                        </Tooltip>
+                      ) : null}
+                      {isGeminiAccount(account) ? (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="icon-sm"
+                              aria-label="Reconnect Antigravity"
+                              onClick={() => onReconnectAntigravity(account)}
+                            >
+                              <LogInIcon />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Reconnect Antigravity</TooltipContent>
+                        </Tooltip>
+                      ) : null}
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => onToggle(account)}
+                      >
+                        {account.isActive ? "Enabled" : "Disabled"}
+                      </Button>
+                    </div>
                   </TableCell>
                 </TableRow>
               ))}
@@ -1015,14 +1171,38 @@ function AccountsView({
                   <span className="text-xs text-muted-foreground">
                     {routeCountForAccount(routes, account.id)} routes
                   </span>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => onToggle(account)}
-                  >
-                    {account.isActive ? "Enabled" : "Disabled"}
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    {isGeminiAccount(account) ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon-sm"
+                        aria-label="Models and quota"
+                        onClick={() => onInspectGemini(account)}
+                      >
+                        <GaugeIcon />
+                      </Button>
+                    ) : null}
+                    {isGeminiAccount(account) ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon-sm"
+                        aria-label="Reconnect Antigravity"
+                        onClick={() => onReconnectAntigravity(account)}
+                      >
+                        <LogInIcon />
+                      </Button>
+                    ) : null}
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => onToggle(account)}
+                    >
+                      {account.isActive ? "Enabled" : "Disabled"}
+                    </Button>
+                  </div>
                 </div>
               </div>
             ))
@@ -1030,6 +1210,207 @@ function AccountsView({
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+function GeminiAccountDialog({
+  account,
+  models,
+  quota,
+  loading,
+  error,
+  onOpenChange,
+}: {
+  account: ProviderAccount | null;
+  models: GeminiAccountModelsResponse | null;
+  quota: GeminiAccountQuotaResponse | null;
+  loading: boolean;
+  error: string | null;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const rows = useMemo(() => {
+    const entries = new Map<string, { id: string; displayName: string }>();
+    models?.models.forEach((model) => entries.set(model.id, model));
+    quota?.quotas.forEach((item) => {
+      if (!entries.has(item.modelId)) {
+        entries.set(item.modelId, { id: item.modelId, displayName: item.modelId });
+      }
+    });
+    return [...entries.values()].sort((left, right) => left.id.localeCompare(right.id));
+  }, [models, quota]);
+  const quotaByModel = useMemo(
+    () => new Map(quota?.quotas.map((item) => [item.modelId, item]) ?? []),
+    [quota],
+  );
+  const quotaSummaryRows = useMemo(() => {
+    const summary = quota?.quotaSummary;
+    if (!summary) {
+      return [];
+    }
+    const standalone = summary.buckets.map((bucket) => ({
+      group: summary.description || "Account",
+      groupDescription: null,
+      bucket,
+    }));
+    const grouped = summary.groups.flatMap((group) =>
+      group.buckets.map((bucket) => ({
+        group: group.displayName,
+        groupDescription: group.description,
+        bucket,
+      })),
+    );
+    return [...standalone, ...grouped];
+  }, [quota]);
+
+  return (
+    <Dialog open={Boolean(account)} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[86svh] overflow-y-auto sm:max-w-4xl">
+        <DialogHeader>
+          <DialogTitle>{account?.name || "Gemini account"}</DialogTitle>
+          <DialogDescription>Models and quota reported by this Google account.</DialogDescription>
+        </DialogHeader>
+        {loading ? (
+          <div className="grid gap-3">
+            <Skeleton className="h-16" />
+            <Skeleton className="h-52" />
+          </div>
+        ) : error ? (
+          <Alert variant="destructive">
+            <ActivityIcon className="size-4" />
+            <AlertTitle>Unable to load account data</AlertTitle>
+            <AlertDescription className="break-words">{error}</AlertDescription>
+          </Alert>
+        ) : (
+          <div className="flex min-w-0 flex-col gap-4">
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <SettingRow label="Project" value={quota?.project || models?.project || "unknown"} />
+              <SettingRow label="Auth" value={quota?.authMode || account?.authMode || "unknown"} />
+              <SettingRow label="Tier" value={formatGeminiTier(quota?.currentTier)} />
+              <SettingRow label="Quota source" value={quota?.quotaSource || "unknown"} />
+            </div>
+            {quota?.paidTier ? (
+              <Alert>
+                <ShieldCheckIcon className="size-4" />
+                <AlertTitle>{quota.paidTier.name || quota.paidTier.id}</AlertTitle>
+                <AlertDescription>{quota.paidTier.description}</AlertDescription>
+              </Alert>
+            ) : null}
+            {quota?.quotaSummaryError ? (
+              <Alert>
+                <ActivityIcon className="size-4" />
+                <AlertTitle>Quota summary unavailable</AlertTitle>
+                <AlertDescription className="break-words">
+                  {quota.quotaSummaryError}
+                </AlertDescription>
+              </Alert>
+            ) : null}
+            {quotaSummaryRows.length > 0 ? (
+              <div className="flex flex-col gap-2">
+                <div className="text-sm font-medium">Usage windows</div>
+                <div className="w-full min-w-0 max-w-full overflow-x-auto rounded-md border">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Model group</TableHead>
+                        <TableHead>Window</TableHead>
+                        <TableHead className="min-w-48">Remaining</TableHead>
+                        <TableHead>Reset</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {quotaSummaryRows.map(({ group, groupDescription, bucket }) => {
+                        const percent = quotaPercent(bucket.remainingFraction);
+                        return (
+                          <TableRow key={`${group}:${bucket.bucketId}`}>
+                            <TableCell>
+                              <div className="font-medium">{group}</div>
+                              {groupDescription ? (
+                                <div className="max-w-72 text-xs text-muted-foreground">
+                                  {groupDescription}
+                                </div>
+                              ) : null}
+                            </TableCell>
+                            <TableCell>
+                              <div>{bucket.displayName || bucket.bucketId}</div>
+                              {bucket.description ? (
+                                <div className="max-w-80 text-xs text-muted-foreground">
+                                  {bucket.description}
+                                </div>
+                              ) : null}
+                            </TableCell>
+                            <TableCell>
+                              {percent === undefined ? (
+                                <span className="text-xs text-muted-foreground">unknown</span>
+                              ) : (
+                                <div className="flex min-w-40 items-center gap-3">
+                                  <Progress value={percent} className="min-w-24" />
+                                  <span className="w-16 text-right font-mono text-xs">
+                                    {formatQuotaPercent(percent)}
+                                  </span>
+                                </div>
+                              )}
+                            </TableCell>
+                            <TableCell>{formatDate(bucket.resetTime)}</TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </div>
+              </div>
+            ) : null}
+            <div className="w-full min-w-0 max-w-full overflow-x-auto rounded-md border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Model</TableHead>
+                    <TableHead>Model ID</TableHead>
+                    <TableHead className="min-w-48">Remaining</TableHead>
+                    <TableHead>Reset</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {rows.map((model) => {
+                    const modelQuota = quotaByModel.get(model.id);
+                    const remaining = modelQuota?.remainingFraction;
+                    const percent = quotaPercent(remaining);
+                    return (
+                      <TableRow key={model.id}>
+                        <TableCell className="font-medium">{model.displayName}</TableCell>
+                        <TableCell className="font-mono text-xs">{model.id}</TableCell>
+                        <TableCell>
+                          {percent === undefined ? (
+                            <span className="text-xs text-muted-foreground">unknown</span>
+                          ) : (
+                            <div className="flex min-w-40 items-center gap-3">
+                              <Progress value={percent} className="min-w-24" />
+                              <span className="w-14 text-right font-mono text-xs">
+                                {percent.toFixed(1)}%
+                              </span>
+                            </div>
+                          )}
+                        </TableCell>
+                        <TableCell>{formatDate(modelQuota?.resetTime)}</TableCell>
+                      </TableRow>
+                    );
+                  })}
+                  {rows.length === 0 ? (
+                    <TableRow>
+                      <TableCell colSpan={4}>
+                        <EmptyNotice
+                          title="No account models returned"
+                          body="Google did not return models for this credential."
+                        />
+                      </TableCell>
+                    </TableRow>
+                  ) : null}
+                </TableBody>
+              </Table>
+            </div>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -1723,6 +2104,10 @@ function SettingsView() {
             <SettingRow label="Anthropic Messages" value="/anthropic/v1/messages" />
             <SettingRow label="Codex Responses" value="/openai/v1/responses" />
             <SettingRow label="OpenAI Chat" value="/openai/v1/chat/completions" />
+            <SettingRow
+              label="Gemini GenerateContent"
+              value="/gemini/v1beta/models/{model}:generateContent"
+            />
             <SettingRow label="Admin API" value="/admin/api" />
             <SettingRow label="Storage" value="SQLite" />
           </CardContent>
@@ -1735,13 +2120,17 @@ function SettingsView() {
             <CardDescription>Headers preserved or supplied by the Rust relay.</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
-            {["x-api-key", "authorization: Bearer", "anthropic-version", "anthropic-beta"].map(
-              (item) => (
-                <div key={item} className="rounded-md border p-3 font-mono text-sm">
-                  {item}
-                </div>
-              ),
-            )}
+            {[
+              "x-api-key",
+              "x-goog-api-key",
+              "authorization: Bearer",
+              "anthropic-version",
+              "anthropic-beta",
+            ].map((item) => (
+              <div key={item} className="rounded-md border p-3 font-mono text-sm">
+                {item}
+              </div>
+            ))}
           </CardContent>
         </Card>
       </TabsContent>
@@ -1873,6 +2262,8 @@ function CreateAccountSheet({
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
 }) {
   const isCodexSubscription = isCodexSubscriptionAuth(form.authMode);
+  const isAntigravityAccount = isAntigravityAccountAuth(form.authMode);
+  const usesTextareaCredential = isCodexSubscription;
   const selectedPreset = providerPresetForForm(form, presets);
   const credentialLabel =
     selectedPreset?.credentialLabel ??
@@ -1945,6 +2336,7 @@ function CreateAccountSheet({
                     <SelectItem value="anthropic-messages">Anthropic Messages</SelectItem>
                     <SelectItem value="openai-responses">OpenAI Responses</SelectItem>
                     <SelectItem value="openai-chat">OpenAI Chat</SelectItem>
+                    <SelectItem value="gemini-generate-content">Gemini GenerateContent</SelectItem>
                   </SelectGroup>
                 </SelectContent>
               </Select>
@@ -1962,8 +2354,10 @@ function CreateAccountSheet({
                 <SelectContent>
                   <SelectGroup>
                     <SelectItem value="x-api-key">x-api-key</SelectItem>
+                    <SelectItem value="x-goog-api-key">x-goog-api-key</SelectItem>
                     <SelectItem value="bearer">Bearer</SelectItem>
                     <SelectItem value="codex-oauth">Codex OAuth</SelectItem>
+                    <SelectItem value="antigravity-oauth">Antigravity OAuth</SelectItem>
                   </SelectGroup>
                 </SelectContent>
               </Select>
@@ -1978,7 +2372,13 @@ function CreateAccountSheet({
             </Alert>
           ) : null}
           <Field
-            label={isCodexSubscription ? "Codex endpoint base" : "Base URL"}
+            label={
+              isCodexSubscription
+                ? "Codex endpoint base"
+                : isAntigravityAccount
+                  ? "Gemini endpoint base"
+                  : "Base URL"
+            }
             htmlFor="account-base-url"
           >
             <Input
@@ -1990,31 +2390,33 @@ function CreateAccountSheet({
               required
             />
           </Field>
-          <Field label={credentialLabel} htmlFor="account-api-key">
-            {isCodexSubscription ? (
-              <Textarea
-                id="account-api-key"
-                className="min-h-28 font-mono text-xs"
-                value={form.apiKey}
-                onChange={(event) =>
-                  setForm((current) => ({ ...current, apiKey: event.target.value }))
-                }
-                placeholder={credentialPlaceholder}
-                required
-              />
-            ) : (
-              <Input
-                id="account-api-key"
-                type="password"
-                value={form.apiKey}
-                onChange={(event) =>
-                  setForm((current) => ({ ...current, apiKey: event.target.value }))
-                }
-                placeholder={credentialPlaceholder}
-                required
-              />
-            )}
-          </Field>
+          {!isAntigravityAccount ? (
+            <Field label={credentialLabel} htmlFor="account-api-key">
+              {usesTextareaCredential ? (
+                <Textarea
+                  id="account-api-key"
+                  className="min-h-28 font-mono text-xs"
+                  value={form.apiKey}
+                  onChange={(event) =>
+                    setForm((current) => ({ ...current, apiKey: event.target.value }))
+                  }
+                  placeholder={credentialPlaceholder}
+                  required
+                />
+              ) : (
+                <Input
+                  id="account-api-key"
+                  type="password"
+                  value={form.apiKey}
+                  onChange={(event) =>
+                    setForm((current) => ({ ...current, apiKey: event.target.value }))
+                  }
+                  placeholder={credentialPlaceholder}
+                  required
+                />
+              )}
+            </Field>
+          ) : null}
           <div className="grid gap-3 sm:grid-cols-[1fr_120px]">
             <SettingRow
               label="Upstream path"
@@ -2048,8 +2450,12 @@ function CreateAccountSheet({
           </div>
           <SheetFooter>
             <Button type="submit">
-              <CableIcon data-icon="inline-start" />
-              Add account
+              {isAntigravityAccount ? (
+                <LogInIcon data-icon="inline-start" />
+              ) : (
+                <CableIcon data-icon="inline-start" />
+              )}
+              {isAntigravityAccount ? "Sign in with Antigravity" : "Add account"}
             </Button>
           </SheetFooter>
         </form>
@@ -2240,6 +2646,7 @@ function CreateRouteSheet({
                     <SelectItem value="anthropic-messages">Anthropic Messages</SelectItem>
                     <SelectItem value="openai-responses">OpenAI Responses</SelectItem>
                     <SelectItem value="openai-chat">OpenAI Chat</SelectItem>
+                    <SelectItem value="gemini-generate-content">Gemini GenerateContent</SelectItem>
                   </SelectGroup>
                 </SelectContent>
               </Select>
@@ -2692,6 +3099,8 @@ function wireApiLabel(value: string) {
       return "OpenAI Responses";
     case "anthropic-messages":
       return "Anthropic Messages";
+    case "gemini-generate-content":
+      return "Gemini GenerateContent";
     default:
       return value;
   }
@@ -2701,11 +3110,16 @@ function upstreamPathForWireApi(value: string, authMode?: string) {
   if (isCodexSubscriptionAuth(authMode ?? "")) {
     return "/backend-api/codex/responses";
   }
+  if (isAntigravityAccountAuth(authMode ?? "")) {
+    return "/v1internal:generateContent";
+  }
   switch (value) {
     case "openai-chat":
       return "/chat/completions";
     case "openai-responses":
       return "/v1/responses";
+    case "gemini-generate-content":
+      return "/v1beta/models/{model}:generateContent";
     default:
       return "/v1/messages";
   }
@@ -2715,6 +3129,14 @@ function isCodexSubscriptionAuth(value: string) {
   return value === "codex-oauth";
 }
 
+function isAntigravityAccountAuth(value: string) {
+  return value === "antigravity-oauth";
+}
+
+function isGeminiAccount(account: ProviderAccount) {
+  return account.provider === "gemini" && isAntigravityAccountAuth(account.authMode);
+}
+
 function numberFromInput(value: string) {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
@@ -2722,6 +3144,24 @@ function numberFromInput(value: string) {
 
 function formatNumber(value: number) {
   return new Intl.NumberFormat().format(value);
+}
+
+function formatGeminiTier(tier: GeminiAccountQuotaResponse["currentTier"]) {
+  if (!tier) {
+    return "unknown";
+  }
+  return tier.name || tier.id || "unknown";
+}
+
+function quotaPercent(value: number | null | undefined) {
+  return value == null ? undefined : Math.max(0, Math.min(100, value * 100));
+}
+
+function formatQuotaPercent(value: number) {
+  if (value === 100) {
+    return "100%";
+  }
+  return `${value.toFixed(value >= 99 ? 3 : 1)}%`;
 }
 
 function formatDate(value: string | null | undefined) {

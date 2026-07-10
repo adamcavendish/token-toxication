@@ -54,23 +54,39 @@ async fn run_server(config: Config) -> Result<(), MainError> {
             path: config.database_path.clone(),
             source,
         })?;
-    let http = aioduct::TokioClient::builder()
-        .tls(aioduct::tls::RustlsConnector::with_webpki_roots())
-        .user_agent("token-toxication/0.1")
-        .timeout(Duration::from_secs(300))
-        .build()
+    let http = build_http_client("token-toxication/0.1", Duration::from_secs(300), false)
+        .map_err(|source| MainError::BuildHttpClient { source })?;
+    let gemini_http = build_http_client("token-toxication/0.1", Duration::from_secs(300), true)
         .map_err(|source| MainError::BuildHttpClient { source })?;
 
     let state = AppState {
         config: config.clone(),
         db,
         http,
+        gemini_http,
+        antigravity_oauth: Default::default(),
         started_at: Utc::now(),
     };
 
     let app = app(state, config.static_dir.clone());
     server::serve(config, https_config, app).await?;
     Ok(())
+}
+
+fn build_http_client(
+    user_agent: &str,
+    timeout: Duration,
+    http1_only: bool,
+) -> Result<aioduct::TokioClient, aioduct::Error> {
+    let mut tls = aioduct::tls::RustlsConnector::with_webpki_roots();
+    if http1_only {
+        tls.config_mut().alpn_protocols = vec![b"http/1.1".to_vec()];
+    }
+    aioduct::TokioClient::builder()
+        .tls(tls)
+        .user_agent(user_agent)
+        .timeout(timeout)
+        .build()
 }
 
 fn generate_openapi(output: PathBuf) -> Result<(), MainError> {

@@ -17,6 +17,7 @@ struct ProviderPresetSpec {
 
 const API_KEY_HELP: &str = "Paste an upstream API key for this provider account.";
 const BEARER_HELP: &str = "Paste an upstream API key. The relay sends it as a Bearer token.";
+const ANTIGRAVITY_ACCOUNT_HELP: &str = "Sign in with the Google account used by Antigravity. OAuth tokens are exchanged and stored by the backend. The backend must set TT_ANTIGRAVITY_OAUTH_CLIENT_SECRET.";
 const SUBSCRIPTION_HELP: &str = "Paste only the raw refresh token. The CLI stores it at ~/.codex/auth.json as tokens.refresh_token; opencode stores it at ~/.local/share/opencode/auth.json as openai.refresh.";
 
 const PROVIDER_PRESETS: &[ProviderPresetSpec] = &[
@@ -63,6 +64,30 @@ const PROVIDER_PRESETS: &[ProviderPresetSpec] = &[
             "chatgpt-plus",
             "chatgpt-pro",
             "openai-codex",
+        ],
+    },
+    ProviderPresetSpec {
+        id: "antigravity",
+        label: "Antigravity OAuth",
+        name: "Gemini Account",
+        provider: "gemini",
+        base_url: "https://cloudcode-pa.googleapis.com",
+        auth_mode: "antigravity-oauth",
+        wire_api: "gemini-generate-content",
+        credential_label: "Google account",
+        credential_placeholder: "Sign in with Antigravity",
+        credential_help: ANTIGRAVITY_ACCOUNT_HELP,
+        aliases: &[
+            "antigravity",
+            "google-antigravity",
+            "google",
+            "google-ai",
+            "google-ai-studio",
+            "google-ai-pro",
+            "google-ai-ultra",
+            "gemini-code-assist",
+            "cloudcode",
+            "generativelanguage",
         ],
     },
     ProviderPresetSpec {

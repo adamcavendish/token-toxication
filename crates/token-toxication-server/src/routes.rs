@@ -10,33 +10,43 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header},
     middleware,
-    response::Response,
+    response::{Html, Response},
     routing::{get, patch, post},
 };
 use chrono::Utc;
 use futures_util::stream;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     AppState,
+    antigravity_oauth::{
+        apply_antigravity_headers, begin_antigravity_oauth, complete_antigravity_oauth,
+        gemini_account_models, gemini_account_quota,
+    },
     auth::{extract_api_key, generate_secret, login, logout, me, require_admin},
     codex_subscription::{
         CodexSubscriptionAuthorization, codex_subscription_authorization,
         is_codex_subscription_auth,
     },
     error::AppError,
+    gemini_code_assist::{
+        build_code_assist_request, gemini_code_assist_authorization, gemini_code_assist_endpoint,
+        is_antigravity_oauth_auth, unwrap_code_assist_response_bytes, unwrap_code_assist_sse_data,
+    },
     models::{
-        AnthropicModel, AnthropicModelListResponse, ApiKeyListResponse, ApiKeyRecord,
-        ApiKeyResponse, CreateApiKeyRequest, CreateApiKeyResponse, CreateModelCatalogEntryRequest,
-        CreateProviderAccountRequest, CreateProviderModelRouteRequest, Dashboard, HealthResponse,
-        MetricsResponse, ModelCatalogEntryResponse, ModelCatalogListResponse, OpenAiModel,
-        OpenAiModelListResponse, ProviderAccountListResponse, ProviderAccountResponse,
-        ProviderModelRouteListResponse, ProviderModelRouteResponse, ProviderPresetListResponse,
-        RequestLog, RequestLogListResponse, RequestSummary, UpdateApiKeyRequest,
-        UpdateModelCatalogEntryRequest, UpdateProviderAccountRequest,
-        UpdateProviderModelRouteRequest,
+        AnthropicModel, AnthropicModelListResponse, AntigravityOAuthStartRequest,
+        AntigravityOAuthStartResponse, ApiKeyListResponse, ApiKeyRecord, ApiKeyResponse,
+        CreateApiKeyRequest, CreateApiKeyResponse, CreateModelCatalogEntryRequest,
+        CreateProviderAccountRequest, CreateProviderModelRouteRequest, Dashboard,
+        GeminiAccountModelsResponse, GeminiAccountQuotaResponse, GeminiModel,
+        GeminiModelListResponse, HealthResponse, MetricsResponse, ModelCatalogEntryResponse,
+        ModelCatalogListResponse, OpenAiModel, OpenAiModelListResponse,
+        ProviderAccountListResponse, ProviderAccountResponse, ProviderModelRouteListResponse,
+        ProviderModelRouteResponse, ProviderPresetListResponse, RequestLog, RequestLogListResponse,
+        RequestSummary, UpdateApiKeyRequest, UpdateModelCatalogEntryRequest,
+        UpdateProviderAccountRequest, UpdateProviderModelRouteRequest,
     },
     provider_catalog::provider_presets,
     routing::{RouteFailure, classify_response_failure, classify_transport_failure},
@@ -62,6 +72,15 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             "/provider-accounts/{id}",
             patch(update_provider_account).delete(delete_provider_account),
         )
+        .route(
+            "/provider-accounts/{id}/gemini/models",
+            get(get_gemini_account_models),
+        )
+        .route(
+            "/provider-accounts/{id}/gemini/quota",
+            get(get_gemini_account_quota),
+        )
+        .route("/oauth/antigravity/start", post(start_antigravity_oauth))
         .route("/provider-presets", get(list_provider_presets))
         .route(
             "/model-catalog",
@@ -81,6 +100,10 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
 
     Router::new()
         .route("/auth/login", post(login))
+        .route(
+            "/oauth/antigravity/callback",
+            get(antigravity_oauth_callback),
+        )
         .merge(protected)
 }
 
@@ -133,6 +156,17 @@ pub async fn relay_openai_chat(
     relay_json_endpoint(state, headers, uri, body, WireApi::OpenAiChat).await
 }
 
+pub async fn relay_gemini_generate_content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(operation): Path<String>,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let (model, method) = parse_gemini_model_operation(&operation)?;
+    relay_gemini_endpoint(state, headers, uri, body, model, method).await
+}
+
 pub async fn list_openai_models(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -156,6 +190,33 @@ pub async fn get_openai_model(
         .await?
         .into_iter()
         .find(|entry| entry.id == model)
+        .ok_or_else(|| AppError::NotFound("model not found".into()))?;
+    Ok(Json(model))
+}
+
+pub async fn list_gemini_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<GeminiModelListResponse>, AppError> {
+    authenticate_relay_api_key(&state, &headers, uri.query()).await?;
+    Ok(Json(GeminiModelListResponse {
+        models: gemini_models(&state).await?,
+    }))
+}
+
+pub async fn get_gemini_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(model): Path<String>,
+) -> Result<Json<GeminiModel>, AppError> {
+    authenticate_relay_api_key(&state, &headers, uri.query()).await?;
+    let model_name = format!("models/{model}");
+    let model = gemini_models(&state)
+        .await?
+        .into_iter()
+        .find(|entry| entry.name == model_name)
         .ok_or_else(|| AppError::NotFound("model not found".into()))?;
     Ok(Json(model))
 }
@@ -195,6 +256,7 @@ enum WireApi {
     AnthropicMessages,
     OpenAiChat,
     OpenAiResponses,
+    GeminiGenerateContent,
 }
 
 impl WireApi {
@@ -203,6 +265,7 @@ impl WireApi {
             Self::AnthropicMessages => "anthropic-messages",
             Self::OpenAiChat => "openai-chat",
             Self::OpenAiResponses => "openai-responses",
+            Self::GeminiGenerateContent => "gemini-generate-content",
         }
     }
 
@@ -211,6 +274,7 @@ impl WireApi {
             Self::AnthropicMessages => "/v1/messages",
             Self::OpenAiChat => "/chat/completions",
             Self::OpenAiResponses => "/v1/responses",
+            Self::GeminiGenerateContent => "/v1beta/models",
         }
     }
 
@@ -219,6 +283,7 @@ impl WireApi {
             Self::AnthropicMessages => "/anthropic/v1/messages",
             Self::OpenAiChat => "/openai/v1/chat/completions",
             Self::OpenAiResponses => "/openai/v1/responses",
+            Self::GeminiGenerateContent => "/gemini/v1beta/models",
         }
     }
 
@@ -226,7 +291,27 @@ impl WireApi {
         match self {
             Self::AnthropicMessages | Self::OpenAiChat => validate_messages_request(value),
             Self::OpenAiResponses => validate_responses_request(value),
+            Self::GeminiGenerateContent => validate_gemini_generate_content_request(value),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeminiMethod {
+    GenerateContent,
+    StreamGenerateContent,
+}
+
+impl GeminiMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GenerateContent => "generateContent",
+            Self::StreamGenerateContent => "streamGenerateContent",
+        }
+    }
+
+    fn is_stream(self) -> bool {
+        matches!(self, Self::StreamGenerateContent)
     }
 }
 
@@ -295,7 +380,7 @@ async fn relay_json_endpoint(
                         account_id: &account.account.id,
                         route_id: &route_id,
                         api_key_id: api_key_id.clone(),
-                        wire_api,
+                        path: wire_api.public_path().to_string(),
                         model: Some(public_model_id.clone()),
                         upstream_model: Some(upstream_model_id.clone()),
                         started,
@@ -331,7 +416,7 @@ async fn relay_json_endpoint(
                     account_id: &account.account.id,
                     route_id: &route_id,
                     api_key_id: api_key_id.clone(),
-                    wire_api,
+                    path: wire_api.public_path().to_string(),
                     model: Some(public_model_id.clone()),
                     upstream_model: Some(upstream_model_id.clone()),
                     started,
@@ -359,7 +444,7 @@ async fn relay_json_endpoint(
                     account_id: &account.account.id,
                     route_id: &route_id,
                     api_key_id: api_key_id.clone(),
-                    wire_api,
+                    path: wire_api.public_path().to_string(),
                     model: Some(public_model_id.clone()),
                     upstream_model: Some(upstream_model_id.clone()),
                     started,
@@ -490,7 +575,307 @@ async fn relay_json_endpoint(
                     account_id: &account.account.id,
                     route_id: &route_id,
                     api_key_id,
-                    wire_api,
+                    path: wire_api.public_path().to_string(),
+                    model: Some(public_model_id),
+                    upstream_model: Some(upstream_model_id),
+                    started,
+                    upstream_url: sanitized_upstream_url,
+                    request_summary: Some(request_summary),
+                },
+                classify_transport_failure(error.to_string(), Utc::now()),
+            )
+            .await?;
+            Err(AppError::Upstream(error.into()))
+        }
+    }
+}
+
+async fn relay_gemini_endpoint(
+    state: AppState,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+    model: String,
+    method: GeminiMethod,
+) -> Result<Response, AppError> {
+    let started = Instant::now();
+    let api_key = authenticate_relay_api_key(&state, &headers, uri.query()).await?;
+
+    let mut request_json: Value = serde_json::from_slice(&body)
+        .map_err(|error| AppError::BadRequest(format!("invalid JSON body: {error}")))?;
+    validate_gemini_generate_content_request(&request_json)?;
+    let api_key_id = api_key.view.id;
+
+    let selection = state
+        .db
+        .select_provider_account_for_wire(
+            WireApi::GeminiGenerateContent.account_value(),
+            Some(model.as_str()),
+        )
+        .await?
+        .ok_or_else(|| AppError::Forbidden("no active provider account is available".into()))?;
+    let route_id = selection.route_id.clone();
+    let public_model_id = selection.public_model_id.clone();
+    let upstream_model_id = selection.upstream_model_id.clone();
+    let public_path = gemini_public_path(&public_model_id, method);
+    let stripped_params = strip_top_level_params(&mut request_json, &selection.strip_params);
+    let account = selection.account;
+    if !is_antigravity_oauth_auth(&account.account.auth_mode) {
+        return Err(AppError::BadRequest(
+            "Gemini native providers require Antigravity OAuth credentials".into(),
+        ));
+    }
+    let fallback_upstream_url = gemini_code_assist_upstream_url(
+        &gemini_code_assist_endpoint(&account.account.base_url),
+        method,
+        uri.query(),
+    );
+
+    let authorization =
+        match gemini_code_assist_authorization(&state.db, &state.gemini_http, &account).await {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                let status = error.status();
+                let failure = if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                {
+                    RouteFailure {
+                        provider_status: Some("blocked"),
+                        route_status: "degraded",
+                        cooldown_until: None,
+                        error: error.to_string(),
+                        status_code: Some(status.as_u16()),
+                    }
+                } else {
+                    classify_transport_failure(error.to_string(), Utc::now())
+                };
+                record_upstream_failure(
+                    &state,
+                    UpstreamFailureLog {
+                        account_id: &account.account.id,
+                        route_id: &route_id,
+                        api_key_id: api_key_id.clone(),
+                        path: public_path.clone(),
+                        model: Some(public_model_id.clone()),
+                        upstream_model: Some(upstream_model_id.clone()),
+                        started,
+                        upstream_url: Some(sanitize_upstream_url(&fallback_upstream_url)),
+                        request_summary: None,
+                    },
+                    failure,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+
+    let session_id = request_json
+        .get("sessionId")
+        .or_else(|| request_json.get("session_id"))
+        .and_then(Value::as_str);
+    let code_assist_json = build_code_assist_request(
+        &request_json,
+        &upstream_model_id,
+        authorization.project.as_deref(),
+        session_id,
+    );
+    let body = serde_json::to_vec(&code_assist_json)
+        .map_err(|error| AppError::Internal(format!("serialize upstream request: {error}")))?;
+    let mut request_summary =
+        build_request_summary(&request_json, body.len() as u64, stripped_params);
+    request_summary.stream = method.is_stream();
+    let upstream_url =
+        gemini_code_assist_upstream_url(&authorization.endpoint, method, uri.query());
+    let sanitized_upstream_url = Some(sanitize_upstream_url(&upstream_url));
+
+    let request = match state.gemini_http.post(&upstream_url) {
+        Ok(request) => request
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )
+            .body(body),
+        Err(error) => {
+            record_upstream_failure(
+                &state,
+                UpstreamFailureLog {
+                    account_id: &account.account.id,
+                    route_id: &route_id,
+                    api_key_id: api_key_id.clone(),
+                    path: public_path.clone(),
+                    model: Some(public_model_id.clone()),
+                    upstream_model: Some(upstream_model_id.clone()),
+                    started,
+                    upstream_url: sanitized_upstream_url.clone(),
+                    request_summary: Some(request_summary.clone()),
+                },
+                classify_transport_failure(error.to_string(), Utc::now()),
+            )
+            .await?;
+            return Err(AppError::Upstream(error));
+        }
+    };
+    let request = request.bearer_auth(&authorization.access_token);
+    let request = apply_antigravity_headers(request)?;
+
+    let upstream = request.send().await;
+    match upstream {
+        Ok(response) => {
+            let status = response.status();
+            let response_headers = response.headers().clone();
+            let content_type = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .cloned()
+                .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+
+            if method.is_stream() {
+                let error = record_upstream_response_result(
+                    &state,
+                    &account.account.id,
+                    &route_id,
+                    &account.account.provider,
+                    status,
+                    &response_headers,
+                    b"",
+                )
+                .await?;
+                state
+                    .db
+                    .insert_request_log(RequestLog {
+                        id: Uuid::new_v4().to_string(),
+                        api_key_id: api_key_id.clone(),
+                        provider_account_id: Some(account.account.id.clone()),
+                        method: "POST".to_string(),
+                        path: public_path.clone(),
+                        model: Some(public_model_id.clone()),
+                        upstream_model: Some(upstream_model_id.clone()),
+                        upstream_url: sanitized_upstream_url.clone(),
+                        request_summary: Some(request_summary.clone()),
+                        status_code: status.as_u16(),
+                        latency_ms: started.elapsed().as_millis() as u64,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_usd: 0.0,
+                        created_at: Utc::now(),
+                        error,
+                    })
+                    .await?;
+                let body_stream = stream::unfold(
+                    (
+                        response.into_bytes_stream(),
+                        String::new(),
+                        status.is_success(),
+                    ),
+                    |(mut body, mut buffer, unwrap_events)| async move {
+                        loop {
+                            if unwrap_events && let Some((event, rest)) = take_sse_event(&buffer) {
+                                buffer = rest;
+                                let chunk = transform_code_assist_sse_event(&event);
+                                return Some((
+                                    Ok(Bytes::from(chunk)),
+                                    (body, buffer, unwrap_events),
+                                ));
+                            }
+
+                            match body.next().await {
+                                Some(Ok(chunk)) if unwrap_events => {
+                                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                                }
+                                Some(Ok(chunk)) => {
+                                    return Some((Ok(chunk), (body, buffer, unwrap_events)));
+                                }
+                                Some(Err(error)) => {
+                                    return Some((
+                                        Err(std::io::Error::other(error)),
+                                        (body, buffer, unwrap_events),
+                                    ));
+                                }
+                                None if unwrap_events && !buffer.is_empty() => {
+                                    let chunk = transform_code_assist_sse_event(&buffer);
+                                    buffer.clear();
+                                    return Some((
+                                        Ok(Bytes::from(chunk)),
+                                        (body, buffer, unwrap_events),
+                                    ));
+                                }
+                                None => return None,
+                            }
+                        }
+                    },
+                );
+                let body = Body::from_stream(body_stream);
+                let mut relay = Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(body)
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                relay.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("no-cache, no-transform"),
+                );
+                Ok(relay)
+            } else {
+                let upstream_bytes = response.bytes().await?;
+                let relay_bytes = if status.is_success() {
+                    unwrap_code_assist_response_bytes(&upstream_bytes)?
+                } else {
+                    upstream_bytes.to_vec()
+                };
+                let usage = parse_usage(&relay_bytes);
+                let error = record_upstream_response_result(
+                    &state,
+                    &account.account.id,
+                    &route_id,
+                    &account.account.provider,
+                    status,
+                    &response_headers,
+                    if status.is_success() {
+                        &relay_bytes
+                    } else {
+                        &upstream_bytes
+                    },
+                )
+                .await?;
+                state
+                    .db
+                    .insert_request_log(RequestLog {
+                        id: Uuid::new_v4().to_string(),
+                        api_key_id: api_key_id.clone(),
+                        provider_account_id: Some(account.account.id.clone()),
+                        method: "POST".to_string(),
+                        path: public_path,
+                        model: Some(public_model_id.clone()),
+                        upstream_model: Some(upstream_model_id.clone()),
+                        upstream_url: sanitized_upstream_url.clone(),
+                        request_summary: Some(request_summary.clone()),
+                        status_code: status.as_u16(),
+                        latency_ms: started.elapsed().as_millis() as u64,
+                        input_tokens: usage.0,
+                        output_tokens: usage.1,
+                        cost_usd: 0.0,
+                        created_at: Utc::now(),
+                        error,
+                    })
+                    .await?;
+                let mut relay = Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(Body::from(relay_bytes))
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                relay
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                Ok(relay)
+            }
+        }
+        Err(error) => {
+            record_upstream_failure(
+                &state,
+                UpstreamFailureLog {
+                    account_id: &account.account.id,
+                    route_id: &route_id,
+                    api_key_id,
+                    path: public_path,
                     model: Some(public_model_id),
                     upstream_model: Some(upstream_model_id),
                     started,
@@ -509,7 +894,7 @@ struct UpstreamFailureLog<'a> {
     account_id: &'a str,
     route_id: &'a str,
     api_key_id: String,
-    wire_api: WireApi,
+    path: String,
     model: Option<String>,
     upstream_model: Option<String>,
     started: Instant,
@@ -530,7 +915,7 @@ async fn record_upstream_failure(
             api_key_id: context.api_key_id,
             provider_account_id: Some(context.account_id.to_string()),
             method: "POST".to_string(),
-            path: context.wire_api.public_path().to_string(),
+            path: context.path,
             model: context.model,
             upstream_model: context.upstream_model,
             upstream_url: context.upstream_url,
@@ -657,6 +1042,86 @@ pub async fn list_provider_accounts(
     Ok(Json(ProviderAccountListResponse {
         data: state.db.list_provider_accounts().await?,
     }))
+}
+
+pub async fn start_antigravity_oauth(
+    State(state): State<AppState>,
+    Json(input): Json<AntigravityOAuthStartRequest>,
+) -> Result<Json<AntigravityOAuthStartResponse>, AppError> {
+    Ok(Json(
+        begin_antigravity_oauth(&state.antigravity_oauth, input).await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AntigravityOAuthCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+pub async fn antigravity_oauth_callback(
+    State(state): State<AppState>,
+    Query(query): Query<AntigravityOAuthCallbackQuery>,
+) -> Html<String> {
+    let outcome = complete_antigravity_oauth(
+        &state.antigravity_oauth,
+        &state.db,
+        &state.gemini_http,
+        query.state.as_deref(),
+        query.code.as_deref(),
+        query.error.as_deref(),
+        query.error_description.as_deref(),
+    )
+    .await;
+    let success = outcome.error.is_none();
+    let payload = json!({
+        "type": "token-toxication:antigravity-oauth",
+        "success": success,
+        "accountId": outcome.account_id,
+        "error": outcome.error,
+    });
+    let payload = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    let notify_opener = outcome.opener_origin.map_or_else(String::new, |origin| {
+        let origin = serde_json::to_string(&origin).unwrap_or_else(|_| "null".to_string());
+        format!("if (window.opener) {{ window.opener.postMessage(payload, {origin}); }}")
+    });
+    Html(format!(
+        r#"<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Antigravity OAuth</title></head>
+<body style="font:14px system-ui,sans-serif;margin:40px;color:#18181b">
+  <strong id="title"></strong>
+  <p id="message"></p>
+  <script>
+    const payload = {payload};
+    document.getElementById("title").textContent = payload.success ? "Antigravity connected" : "Antigravity sign-in failed";
+    document.getElementById("message").textContent = payload.success ? "This window can close now." : payload.error;
+    {notify_opener}
+    if (payload.success) setTimeout(() => window.close(), 800);
+  </script>
+</body>
+</html>"#
+    ))
+}
+
+pub async fn get_gemini_account_models(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<GeminiAccountModelsResponse>, AppError> {
+    Ok(Json(
+        gemini_account_models(&state.db, &state.gemini_http, &id).await?,
+    ))
+}
+
+pub async fn get_gemini_account_quota(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<GeminiAccountQuotaResponse>, AppError> {
+    Ok(Json(
+        gemini_account_quota(&state.db, &state.gemini_http, &id).await?,
+    ))
 }
 
 pub async fn list_provider_presets() -> Json<ProviderPresetListResponse> {
@@ -871,6 +1336,22 @@ fn validate_responses_request(value: &Value) -> Result<(), AppError> {
     }
 }
 
+fn validate_gemini_generate_content_request(value: &Value) -> Result<(), AppError> {
+    if !value.is_object() {
+        return Err(AppError::BadRequest(
+            "request body must be an object".into(),
+        ));
+    }
+    if value
+        .get("contents")
+        .is_some_and(|contents| !contents.is_null())
+    {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest("missing Gemini contents field".into()))
+    }
+}
+
 fn apply_protocol_headers<'a, R, C>(
     mut request: RequestBuilderSend<'a, R, C>,
     wire_api: WireApi,
@@ -903,6 +1384,10 @@ where
 {
     if auth_mode == "bearer" {
         Ok(request.bearer_auth(api_key))
+    } else if auth_mode == "x-goog-api-key" {
+        let api_key = HeaderValue::from_str(api_key)
+            .map_err(|error| AppError::Internal(format!("invalid provider API key: {error}")))?;
+        Ok(request.header(HeaderName::from_static("x-goog-api-key"), api_key))
     } else if auth_mode == "codex-oauth" {
         Err(AppError::Internal(
             "codex-oauth provider auth must be resolved before proxying".into(),
@@ -938,13 +1423,109 @@ where
 fn upstream_url(base_url: &str, path: &str) -> String {
     let base_url = base_url.trim_end_matches('/');
     let path = path.trim_start_matches('/');
-    if let Some(rest) = path.strip_prefix("v1/")
-        && base_url.ends_with("/v1")
+    if let Some((version, rest)) = path.split_once('/')
+        && version.starts_with('v')
+        && base_url.ends_with(&format!("/{version}"))
     {
         format!("{base_url}/{rest}")
     } else {
         format!("{base_url}/{path}")
     }
+}
+
+fn gemini_code_assist_upstream_url(
+    endpoint: &str,
+    method: GeminiMethod,
+    query: Option<&str>,
+) -> String {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    let endpoint = endpoint
+        .strip_suffix("/v1internal")
+        .unwrap_or(endpoint)
+        .trim_end_matches('/');
+    let url = format!("{endpoint}/v1internal:{}", method.as_str());
+    match forwarded_code_assist_query(query, method) {
+        Some(query) => format!("{url}?{query}"),
+        None => url,
+    }
+}
+
+fn gemini_public_path(model: &str, method: GeminiMethod) -> String {
+    format!("/gemini/v1beta/models/{model}:{}", method.as_str())
+}
+
+fn parse_gemini_model_operation(operation: &str) -> Result<(String, GeminiMethod), AppError> {
+    let (model, method) = operation.rsplit_once(':').ok_or_else(|| {
+        AppError::BadRequest(
+            "Gemini path must end with :generateContent or :streamGenerateContent".into(),
+        )
+    })?;
+    if model.trim().is_empty() {
+        return Err(AppError::BadRequest("Gemini model is required".into()));
+    }
+    let method = match method {
+        "generateContent" => GeminiMethod::GenerateContent,
+        "streamGenerateContent" => GeminiMethod::StreamGenerateContent,
+        _ => {
+            return Err(AppError::BadRequest(
+                "unsupported Gemini generateContent method".into(),
+            ));
+        }
+    };
+    Ok((model.to_string(), method))
+}
+
+fn forwarded_code_assist_query(query: Option<&str>, method: GeminiMethod) -> Option<String> {
+    let mut forwarded = Vec::new();
+    if method.is_stream() {
+        forwarded.push("alt=sse");
+    }
+    if let Some(query) = query {
+        forwarded.extend(
+            query
+                .split('&')
+                .filter(|part| !part.is_empty())
+                .filter(|part| {
+                    let key = part.split_once('=').map_or(*part, |(key, _)| key);
+                    key != "key" && key != "alt"
+                }),
+        );
+    }
+    if forwarded.is_empty() {
+        None
+    } else {
+        Some(forwarded.join("&"))
+    }
+}
+
+fn take_sse_event(buffer: &str) -> Option<(String, String)> {
+    if let Some(index) = buffer.find("\n\n") {
+        let event = buffer[..index].to_string();
+        let rest = buffer[index + 2..].to_string();
+        return Some((event, rest));
+    }
+    if let Some(index) = buffer.find("\r\n\r\n") {
+        let event = buffer[..index].to_string();
+        let rest = buffer[index + 4..].to_string();
+        return Some((event, rest));
+    }
+    None
+}
+
+fn transform_code_assist_sse_event(event: &str) -> String {
+    let mut transformed = String::new();
+    for line in event.lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            transformed.push_str("data: ");
+            transformed.push_str(&unwrap_code_assist_sse_data(data.trim_start()));
+            transformed.push('\n');
+        } else {
+            transformed.push_str(line);
+            transformed.push('\n');
+        }
+    }
+    transformed.push('\n');
+    transformed
 }
 
 fn sanitize_upstream_url(value: &str) -> String {
@@ -1008,6 +1589,17 @@ fn parse_usage(bytes: &[u8]) -> (u64, u64) {
         return (0, 0);
     };
     let Some(usage) = value.get("usage") else {
+        if let Some(usage) = value.get("usageMetadata") {
+            let input = usage
+                .get("promptTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let output = usage
+                .get("candidatesTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            return (input, output);
+        }
         return (0, 0);
     };
     let input = usage
@@ -1052,6 +1644,24 @@ async fn openai_models(state: &AppState) -> Result<Vec<OpenAiModel>, AppError> {
             object: "model".to_string(),
             created: model.created_at.timestamp(),
             owned_by: model.provider,
+        })
+        .collect())
+}
+
+async fn gemini_models(state: &AppState) -> Result<Vec<GeminiModel>, AppError> {
+    let models = state
+        .db
+        .list_routable_model_catalog(&[WireApi::GeminiGenerateContent.account_value()])
+        .await?;
+    Ok(models
+        .into_iter()
+        .map(|model| GeminiModel {
+            name: format!("models/{}", model.id),
+            display_name: model.display_name,
+            supported_generation_methods: vec![
+                "generateContent".to_string(),
+                "streamGenerateContent".to_string(),
+            ],
         })
         .collect())
 }
@@ -1155,5 +1765,76 @@ mod tests {
             sanitize_upstream_url("https://api.example.com/v1/messages?token=secret"),
             "https://api.example.com/v1/messages"
         );
+    }
+
+    #[test]
+    fn gemini_model_operation_parses_generate_methods() {
+        let (model, method) =
+            parse_gemini_model_operation("gemini-3.5-flash:generateContent").unwrap();
+        assert_eq!(model, "gemini-3.5-flash");
+        assert_eq!(method, GeminiMethod::GenerateContent);
+
+        let (model, method) =
+            parse_gemini_model_operation("gemini-3.5-flash:streamGenerateContent").unwrap();
+        assert_eq!(model, "gemini-3.5-flash");
+        assert_eq!(method, GeminiMethod::StreamGenerateContent);
+        assert!(parse_gemini_model_operation("gemini-3.5-flash:countTokens").is_err());
+    }
+
+    #[test]
+    fn gemini_code_assist_upstream_url_targets_internal_endpoint() {
+        assert_eq!(
+            gemini_code_assist_upstream_url(
+                "https://cloudcode-pa.googleapis.com",
+                GeminiMethod::StreamGenerateContent,
+                Some("key=tokentoxication-secret&alt=json&trace=1")
+            ),
+            "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse&trace=1"
+        );
+
+        assert_eq!(
+            gemini_code_assist_upstream_url(
+                "https://cloudcode-pa.googleapis.com/v1internal",
+                GeminiMethod::GenerateContent,
+                None
+            ),
+            "https://cloudcode-pa.googleapis.com/v1internal:generateContent"
+        );
+    }
+
+    #[test]
+    fn gemini_code_assist_sse_event_unwraps_response() {
+        let event = transform_code_assist_sse_event(
+            r#"data: {"traceId":"trace-1","response":{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}}"#,
+        );
+
+        assert!(event.starts_with("data: {"));
+        assert!(event.contains(r#""responseId":"trace-1""#));
+        assert!(event.contains(r#""text":"hi""#));
+        assert!(!event.contains(r#""response":{"#));
+    }
+
+    #[test]
+    fn gemini_generate_content_requires_contents() {
+        assert!(
+            validate_gemini_generate_content_request(&json!({
+                "contents": [{"parts": [{"text": "hello"}]}]
+            }))
+            .is_ok()
+        );
+        assert!(validate_gemini_generate_content_request(&json!({"input": "hello"})).is_err());
+    }
+
+    #[test]
+    fn parse_usage_reads_gemini_usage_metadata() {
+        let body = serde_json::to_vec(&json!({
+            "usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 7
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(parse_usage(&body), (11, 7));
     }
 }

@@ -206,6 +206,100 @@ pub struct ProviderAccountResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct AntigravityOAuthStartRequest {
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub priority: i32,
+    pub redirect_uri: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityOAuthStartResponse {
+    pub authorization_url: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiAccountTier {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiAccountModel {
+    pub id: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiAccountModelsResponse {
+    pub account_id: String,
+    pub project: Option<String>,
+    pub endpoint: String,
+    pub models: Vec<GeminiAccountModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiAccountQuota {
+    pub model_id: String,
+    pub remaining_fraction: Option<f64>,
+    pub reset_time: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiAccountQuotaBucket {
+    pub bucket_id: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub window: Option<String>,
+    pub remaining_fraction: Option<f64>,
+    pub remaining_amount: Option<f64>,
+    pub disabled: Option<bool>,
+    pub reset_time: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiAccountQuotaGroup {
+    pub display_name: String,
+    pub description: Option<String>,
+    pub buckets: Vec<GeminiAccountQuotaBucket>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiAccountQuotaSummary {
+    pub description: Option<String>,
+    pub buckets: Vec<GeminiAccountQuotaBucket>,
+    pub groups: Vec<GeminiAccountQuotaGroup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiAccountQuotaResponse {
+    pub account_id: String,
+    pub auth_mode: String,
+    pub project: Option<String>,
+    pub endpoint: String,
+    pub quota_source: String,
+    pub current_tier: Option<GeminiAccountTier>,
+    pub paid_tier: Option<GeminiAccountTier>,
+    pub quotas: Vec<GeminiAccountQuota>,
+    pub quota_summary: Option<GeminiAccountQuotaSummary>,
+    pub quota_summary_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderPreset {
     pub id: String,
     pub label: String,
@@ -353,6 +447,19 @@ pub struct OpenAiModel {
 pub struct OpenAiModelListResponse {
     pub object: String,
     pub data: Vec<OpenAiModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiModel {
+    pub name: String,
+    pub display_name: String,
+    pub supported_generation_methods: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GeminiModelListResponse {
+    pub models: Vec<GeminiModel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
