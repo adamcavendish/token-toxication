@@ -12,8 +12,9 @@ use crate::{
         ApiKeyRecord, ApiKeyView, CreateApiKeyRequest, CreateModelCatalogEntryRequest,
         CreateProviderAccountRequest, CreateProviderModelRouteRequest, Dashboard,
         ModelCatalogEntry, ProviderAccount, ProviderAccountRecord, ProviderModelRoute, RequestLog,
-        RequestSummary, UpdateApiKeyRequest, UpdateModelCatalogEntryRequest,
-        UpdateProviderAccountRequest, UpdateProviderModelRouteRequest, UsageSummary,
+        RequestSummary, RequestTrend, RequestTrendBucket, UpdateApiKeyRequest,
+        UpdateModelCatalogEntryRequest, UpdateProviderAccountRequest,
+        UpdateProviderModelRouteRequest, UsageSummary,
     },
     provider_catalog::{default_wire_api_for_provider, normalize_provider_alias},
 };
@@ -1045,6 +1046,7 @@ impl Db {
         )?;
         let today = Utc::now().date_naive();
         let usage = usage_summary(&conn, today)?;
+        let request_trend = request_trend(&conn, Utc::now())?;
         drop(conn);
 
         Ok(Dashboard {
@@ -1055,6 +1057,7 @@ impl Db {
             usage,
             accounts: self.list_provider_accounts().await?,
             recent_requests: self.list_request_logs(10).await?,
+            request_trend,
         })
     }
 }
@@ -1272,6 +1275,68 @@ fn usage_summary(conn: &Connection, today: NaiveDate) -> Result<UsageSummary, ru
     })
 }
 
+const REQUEST_TREND_BUCKET_COUNT: i64 = 12;
+const REQUEST_TREND_BUCKET_SECONDS: i64 = 5 * 60;
+
+fn request_trend(conn: &Connection, now: DateTime<Utc>) -> Result<RequestTrend, rusqlite::Error> {
+    let current_bucket_started_at =
+        now.timestamp().div_euclid(REQUEST_TREND_BUCKET_SECONDS) * REQUEST_TREND_BUCKET_SECONDS;
+    let window_started_at =
+        current_bucket_started_at - (REQUEST_TREND_BUCKET_COUNT - 1) * REQUEST_TREND_BUCKET_SECONDS;
+    let window_ended_at = current_bucket_started_at + REQUEST_TREND_BUCKET_SECONDS;
+    let window_started_at_text = DateTime::from_timestamp(window_started_at, 0)
+        .expect("request trend start is in range")
+        .to_rfc3339();
+    let window_ended_at_text = DateTime::from_timestamp(window_ended_at, 0)
+        .expect("request trend end is in range")
+        .to_rfc3339();
+    let mut buckets = (0..REQUEST_TREND_BUCKET_COUNT)
+        .map(|index| RequestTrendBucket {
+            started_at: DateTime::from_timestamp(
+                window_started_at + index * REQUEST_TREND_BUCKET_SECONDS,
+                0,
+            )
+            .expect("request trend timestamp is in range"),
+            request_count: 0,
+        })
+        .collect::<Vec<_>>();
+
+    let mut stmt = conn.prepare(
+        "SELECT (unixepoch(created_at) - ?1) / ?2 AS bucket_index, COUNT(*)
+         FROM request_logs
+         WHERE created_at >= ?3 AND created_at < ?4
+         GROUP BY bucket_index
+         ORDER BY bucket_index",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            window_started_at,
+            REQUEST_TREND_BUCKET_SECONDS,
+            window_started_at_text,
+            window_ended_at_text
+        ],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    for row in rows {
+        let (index, count) = row?;
+        if let Some(bucket) = usize::try_from(index)
+            .ok()
+            .and_then(|index| buckets.get_mut(index))
+        {
+            bucket.request_count = count as u64;
+        }
+    }
+
+    Ok(RequestTrend {
+        window_started_at: DateTime::from_timestamp(window_started_at, 0)
+            .expect("request trend start is in range"),
+        window_ended_at: DateTime::from_timestamp(window_ended_at, 0)
+            .expect("request trend end is in range"),
+        bucket_duration_seconds: REQUEST_TREND_BUCKET_SECONDS as u64,
+        buckets,
+    })
+}
+
 fn parse_time(value: &str) -> DateTime<Utc> {
     parse_time_opt(Some(value)).unwrap_or_else(Utc::now)
 }
@@ -1377,6 +1442,82 @@ fn default_display_name(value: String, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_trend_counts_real_five_minute_intervals() {
+        let path =
+            std::env::temp_dir().join(format!("token-toxication-{}.sqlite3", Uuid::new_v4()));
+        let db = Db::open(&path).await.expect("open test database");
+        let now = DateTime::parse_from_rfc3339("2026-07-15T02:02:00Z")
+            .expect("parse now")
+            .with_timezone(&Utc);
+
+        for (index, timestamp) in [
+            "2026-07-15T01:04:59Z",
+            "2026-07-15T01:05:00Z",
+            "2026-07-15T01:09:59Z",
+            "2026-07-15T01:10:00Z",
+            "2026-07-15T01:35:00Z",
+            "2026-07-15T02:00:00Z",
+            "2026-07-15T02:02:00Z",
+            "2026-07-15T02:05:00Z",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.insert_request_log(RequestLog {
+                id: format!("request-{index}"),
+                api_key_id: "test-key".to_string(),
+                provider_account_id: None,
+                method: "POST".to_string(),
+                path: "/openai/v1/responses".to_string(),
+                model: Some("test-model".to_string()),
+                upstream_model: None,
+                upstream_url: None,
+                request_summary: None,
+                status_code: 200,
+                latency_ms: 10,
+                input_tokens: 1,
+                output_tokens: 1,
+                cost_usd: 0.0,
+                created_at: DateTime::parse_from_rfc3339(timestamp)
+                    .expect("parse request timestamp")
+                    .with_timezone(&Utc),
+                error: None,
+            })
+            .await
+            .expect("insert request log");
+        }
+
+        let conn = db.conn.lock().await;
+        let trend = request_trend(&conn, now).expect("build request trend");
+        drop(conn);
+
+        assert_eq!(trend.bucket_duration_seconds, 300);
+        assert_eq!(trend.buckets.len(), 12);
+        assert_eq!(
+            trend.window_started_at.to_rfc3339(),
+            "2026-07-15T01:05:00+00:00"
+        );
+        assert_eq!(
+            trend.window_ended_at.to_rfc3339(),
+            "2026-07-15T02:05:00+00:00"
+        );
+        assert_eq!(trend.buckets[0].request_count, 2);
+        assert_eq!(trend.buckets[1].request_count, 1);
+        assert_eq!(trend.buckets[6].request_count, 1);
+        assert_eq!(trend.buckets[11].request_count, 2);
+        assert_eq!(
+            trend
+                .buckets
+                .iter()
+                .map(|bucket| bucket.request_count)
+                .sum::<u64>(),
+            6
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
 
     #[tokio::test]
     async fn primary_route_wins_and_rewrites_upstream_model() {
