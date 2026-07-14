@@ -33,6 +33,7 @@ import type {
   ProviderModelRoute,
   ProviderPreset,
   RequestLog,
+  RequestTrend,
 } from "./types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -825,7 +826,6 @@ function Overview({
   onCreateKey: () => void;
   onCreateAccount: () => void;
 }) {
-  const trend = useMemo(() => buildTrend(dashboard.recentRequests), [dashboard.recentRequests]);
   return (
     <div className="flex flex-col gap-5">
       <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
@@ -860,7 +860,7 @@ function Overview({
           <CardHeader className="flex-row items-start justify-between gap-4">
             <div className="flex flex-col gap-1">
               <CardTitle>Request flow</CardTitle>
-              <CardDescription>Recent relay volume across the local log window.</CardDescription>
+              <CardDescription>Completed relay requests during the last hour.</CardDescription>
             </div>
             <Button type="button" onClick={onCreateKey}>
               <PlusIcon data-icon="inline-start" />
@@ -868,7 +868,7 @@ function Overview({
             </Button>
           </CardHeader>
           <CardContent>
-            <TrendChart values={trend} />
+            <TrendChart trend={dashboard.requestTrend} />
           </CardContent>
         </Card>
 
@@ -3134,44 +3134,133 @@ function EmptyNotice({ title, body }: { title: string; body: string }) {
   );
 }
 
-function TrendChart({ values }: { values: number[] }) {
+function TrendChart({ trend }: { trend: RequestTrend }) {
+  const values = trend.buckets.map((bucket) => bucket.requestCount);
   const peak = Math.max(...values, 0);
-  const max = Math.max(peak, 1);
-  const points = values
-    .map((value, index) => {
-      const x = (index / Math.max(values.length - 1, 1)) * 100;
-      const y = 100 - (value / max) * 78 - 10;
-      return `${x},${y}`;
-    })
-    .join(" ");
+  const max = niceChartMaximum(peak);
+  const chartTop = 4;
+  const chartBottom = 96;
+  const pointPositions = values.map((value, index) => {
+    const x = (index / Math.max(values.length - 1, 1)) * 100;
+    const y = chartBottom - (value / max) * (chartBottom - chartTop);
+    return { x, y, value, bucket: trend.buckets[index] };
+  });
+  const points = pointPositions.map(({ x, y }) => `${x},${y}`).join(" ");
   const total = values.reduce((sum, value) => sum + value, 0);
+  const average = values.length > 0 ? total / values.length : 0;
+  const intervalMinutes = Math.round(trend.bucketDurationSeconds / 60);
+  const firstBucket = trend.buckets[0];
+  const middleBucket = trend.buckets[Math.floor((trend.buckets.length - 1) / 2)];
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="h-48 overflow-hidden rounded-lg border bg-muted/20 p-4">
-        <svg
-          viewBox="0 0 100 100"
-          preserveAspectRatio="none"
-          className="h-full w-full text-foreground/70"
-          role="img"
-          aria-label="Recent request volume"
-        >
-          <polygon points={`0,100 ${points} 100,100`} className="fill-primary/5" />
-          <polyline
-            points={points}
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            vectorEffect="non-scaling-stroke"
-          />
-        </svg>
+      <div className="rounded-lg border bg-muted/10 p-4">
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div>
+            <div className="text-sm font-medium">Requests per {intervalMinutes} minutes</div>
+            <p className="text-xs text-muted-foreground">
+              Each point counts completed requests in one interval. Hover or focus for details.
+            </p>
+          </div>
+          <Badge variant="outline">Last hour</Badge>
+        </div>
+
+        <div className="mt-4 grid grid-cols-[2.5rem_minmax(0,1fr)] gap-x-2">
+          <div className="relative h-40 text-right text-[11px] tabular-nums text-muted-foreground">
+            <span className="absolute top-[4%] right-0 -translate-y-1/2">{formatNumber(max)}</span>
+            <span className="absolute top-1/2 right-0 -translate-y-1/2">
+              {formatNumber(max / 2)}
+            </span>
+            <span className="absolute right-0 bottom-[4%] translate-y-1/2">0</span>
+          </div>
+
+          <div className="relative h-40" aria-label="Request count by local time">
+            <svg
+              viewBox="0 0 100 100"
+              preserveAspectRatio="none"
+              className="pointer-events-none absolute inset-0 h-full w-full text-foreground/70"
+              role="img"
+              aria-label={`Request counts in ${intervalMinutes}-minute intervals during the last hour`}
+            >
+              {[chartTop, 50, chartBottom].map((y) => (
+                <line
+                  key={y}
+                  x1="0"
+                  x2="100"
+                  y1={y}
+                  y2={y}
+                  className="stroke-border"
+                  strokeWidth="1"
+                  strokeDasharray={y === chartBottom ? undefined : "3 3"}
+                  vectorEffect="non-scaling-stroke"
+                />
+              ))}
+              <polygon
+                points={`0,${chartBottom} ${points} 100,${chartBottom}`}
+                className="fill-primary/5"
+              />
+              <polyline
+                points={points}
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                vectorEffect="non-scaling-stroke"
+              />
+            </svg>
+
+            {pointPositions.map(({ x, y, value, bucket }) => (
+              <Tooltip key={bucket.startedAt}>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    className="group absolute z-10 flex size-7 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    style={{ left: `${x}%`, top: `${y}%` }}
+                    aria-label={`${formatChartInterval(bucket.startedAt, trend.bucketDurationSeconds)}: ${formatRequestCount(value)}`}
+                  >
+                    <span className="size-2.5 rounded-full border-2 border-background bg-foreground shadow-sm transition-transform group-hover:scale-125 group-focus-visible:scale-125" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="top" sideOffset={4}>
+                  <span className="font-medium">
+                    {formatChartInterval(bucket.startedAt, trend.bucketDurationSeconds)}
+                  </span>
+                  <span>{formatRequestCount(value)}</span>
+                </TooltipContent>
+              </Tooltip>
+            ))}
+
+            {total === 0 ? (
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                <span className="rounded-md border bg-background/90 px-2 py-1 text-xs text-muted-foreground shadow-sm">
+                  No requests in this window
+                </span>
+              </div>
+            ) : null}
+          </div>
+
+          <div />
+          <div className="mt-2 flex justify-between text-[11px] tabular-nums text-muted-foreground">
+            <span>{firstBucket ? formatChartTime(firstBucket.startedAt) : ""}</span>
+            <span>{middleBucket ? formatChartTime(middleBucket.startedAt) : ""}</span>
+            <span>Now</span>
+          </div>
+          <div />
+          <div className="mt-1 text-center text-[11px] text-muted-foreground">Local time</div>
+        </div>
+
+        <p className="mt-3 text-xs text-muted-foreground">
+          The rightmost interval is still in progress, so its count may increase.
+        </p>
       </div>
       <div className="grid gap-3 md:grid-cols-3">
-        <ChartStat label="Window total" value={formatNumber(total)} />
-        <ChartStat label="Peak bucket" value={formatNumber(peak)} />
-        <ChartStat label="Buckets" value={String(values.length)} />
+        <ChartStat label="Last-hour total" value={formatNumber(total)} />
+        <ChartStat label={`Peak / ${intervalMinutes} min`} value={formatNumber(peak)} />
+        <ChartStat
+          label={`Average / ${intervalMinutes} min`}
+          value={average.toLocaleString(undefined, { maximumFractionDigits: 1 })}
+        />
       </div>
     </div>
   );
@@ -3266,14 +3355,6 @@ function formatRequestSummary(log: RequestLog) {
   const stripped =
     summary.strippedParams.length > 0 ? ` · stripped ${summary.strippedParams.join(", ")}` : "";
   return `${formatNumber(summary.bodyBytes)} bytes · ${stream} · keys ${keys}${stripped}`;
-}
-
-function buildTrend(logs: readonly RequestLog[]) {
-  const buckets = new Array<number>(12).fill(0);
-  logs.forEach((_, index) => {
-    buckets[index % buckets.length] += 1;
-  });
-  return buckets.reverse();
 }
 
 function currentViewLabel(view: View) {
@@ -3550,6 +3631,32 @@ function numberFromInput(value: string) {
 
 function formatNumber(value: number) {
   return new Intl.NumberFormat().format(value);
+}
+
+function niceChartMaximum(value: number) {
+  if (value <= 4) {
+    return 4;
+  }
+  const magnitude = 10 ** Math.floor(Math.log10(value));
+  const normalized = value / magnitude;
+  const factor = normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
+  return factor * magnitude;
+}
+
+function formatChartTime(value: string) {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
+function formatChartInterval(startedAt: string, durationSeconds: number) {
+  const endedAt = new Date(new Date(startedAt).getTime() + durationSeconds * 1_000);
+  return `${formatChartTime(startedAt)}–${formatChartTime(endedAt.toISOString())}`;
+}
+
+function formatRequestCount(value: number) {
+  return `${formatNumber(value)} ${value === 1 ? "request" : "requests"}`;
 }
 
 function formatGeminiTier(tier: GeminiAccountQuotaResponse["currentTier"]) {

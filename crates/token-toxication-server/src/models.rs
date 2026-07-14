@@ -149,6 +149,22 @@ pub struct UsageSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct RequestTrendBucket {
+    pub started_at: DateTime<Utc>,
+    pub request_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestTrend {
+    pub window_started_at: DateTime<Utc>,
+    pub window_ended_at: DateTime<Utc>,
+    pub bucket_duration_seconds: u64,
+    pub buckets: Vec<RequestTrendBucket>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct Dashboard {
     pub active_api_keys: u64,
     pub total_api_keys: u64,
@@ -157,6 +173,7 @@ pub struct Dashboard {
     pub usage: UsageSummary,
     pub accounts: Vec<ProviderAccount>,
     pub recent_requests: Vec<RequestLog>,
+    pub request_trend: RequestTrend,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
