@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{hash_secret, key_preview},
+    codex_subscription::{canonicalize_legacy_codex_base_url, is_codex_subscription_auth},
     models::{
         ApiKeyRecord, ApiKeyView, CreateApiKeyRequest, CreateModelCatalogEntryRequest,
         CreateProviderAccountRequest, CreateProviderModelRouteRequest, Dashboard,
@@ -48,7 +49,7 @@ impl Db {
                 .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         }
 
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
@@ -173,6 +174,13 @@ impl Db {
             "strip_params",
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
+        let migrated_codex_accounts = migrate_legacy_codex_base_urls(&mut conn)?;
+        if migrated_codex_accounts > 0 {
+            tracing::info!(
+                migrated_codex_accounts,
+                "migrated legacy Codex account base URLs"
+            );
+        }
         conn.execute_batch(
             r#"
             CREATE INDEX IF NOT EXISTS idx_provider_accounts_wire_api
@@ -408,12 +416,13 @@ impl Db {
     ) -> Result<ProviderAccount, rusqlite::Error> {
         let now = Utc::now();
         let provider = normalize_provider(&input.provider);
+        let auth_mode = normalize_auth_mode(&input.auth_mode);
         let account = ProviderAccount {
             id: Uuid::new_v4().to_string(),
             name: input.name,
             provider,
-            base_url: normalize_base_url(&input.base_url),
-            auth_mode: normalize_auth_mode(&input.auth_mode),
+            base_url: normalize_provider_base_url(&input.base_url, &auth_mode),
+            auth_mode,
             wire_api: normalize_wire_api(&input.wire_api, &input.provider),
             is_active: input.is_active,
             priority: input.priority,
@@ -805,18 +814,22 @@ impl Db {
             .wire_api
             .map(|wire_api| normalize_wire_api(&wire_api, &provider))
             .unwrap_or(current.wire_api);
+        let auth_mode = input
+            .auth_mode
+            .as_deref()
+            .map(normalize_auth_mode)
+            .unwrap_or_else(|| current.auth_mode.clone());
+        let base_url = input
+            .base_url
+            .as_deref()
+            .map(|url| normalize_provider_base_url(url, &auth_mode))
+            .unwrap_or_else(|| normalize_provider_base_url(&current.base_url, &auth_mode));
         let account = ProviderAccount {
             id: current.id,
             name: input.name.unwrap_or(current.name),
             provider,
-            base_url: input
-                .base_url
-                .map(|url| normalize_base_url(&url))
-                .unwrap_or(current.base_url),
-            auth_mode: input
-                .auth_mode
-                .map(|mode| normalize_auth_mode(&mode))
-                .unwrap_or(current.auth_mode),
+            base_url,
+            auth_mode,
             wire_api,
             is_active: input.is_active.unwrap_or(current.is_active),
             priority: input.priority.unwrap_or(current.priority),
@@ -1078,6 +1091,31 @@ fn ensure_column(
     Ok(())
 }
 
+fn migrate_legacy_codex_base_urls(conn: &mut Connection) -> Result<usize, rusqlite::Error> {
+    let transaction = conn.transaction()?;
+    let candidates = {
+        let mut statement = transaction.prepare(
+            "SELECT id, base_url FROM provider_accounts WHERE auth_mode = 'codex-oauth'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut migrated = 0;
+    for (id, base_url) in candidates {
+        let Some(base_url) = canonicalize_legacy_codex_base_url(&base_url) else {
+            continue;
+        };
+        migrated += transaction.execute(
+            "UPDATE provider_accounts SET base_url = ?1 WHERE id = ?2",
+            params![base_url, id],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(migrated)
+}
+
 fn rows_to_accounts<P>(
     stmt: &mut rusqlite::Statement<'_>,
     params: P,
@@ -1285,6 +1323,15 @@ fn normalize_wire_api(value: &str, provider: &str) -> String {
 
 fn normalize_base_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_string()
+}
+
+fn normalize_provider_base_url(value: &str, auth_mode: &str) -> String {
+    let base_url = normalize_base_url(value);
+    if is_codex_subscription_auth(auth_mode) {
+        canonicalize_legacy_codex_base_url(&base_url).unwrap_or(base_url)
+    } else {
+        base_url
+    }
 }
 
 fn normalize_family(value: &str) -> String {
@@ -1645,6 +1692,142 @@ mod tests {
             normalize_wire_api("", "codex-subscription"),
             "openai-responses"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_account_writes_canonicalize_legacy_base_urls() {
+        let path =
+            std::env::temp_dir().join(format!("token-toxication-{}.sqlite3", Uuid::new_v4()));
+        let db = Db::open(&path).await.expect("open test database");
+        let account = db
+            .create_provider_account(CreateProviderAccountRequest {
+                name: "Codex".to_string(),
+                provider: "codex-subscription".to_string(),
+                base_url: "https://relay.example/backend-api/codex/".to_string(),
+                auth_mode: "codex-oauth".to_string(),
+                wire_api: "openai-responses".to_string(),
+                api_key: "refresh-token".to_string(),
+                is_active: true,
+                priority: 0,
+            })
+            .await
+            .expect("create Codex account");
+        assert_eq!(account.base_url, "https://relay.example/backend-api");
+
+        let account = db
+            .update_provider_account(
+                &account.id,
+                UpdateProviderAccountRequest {
+                    name: None,
+                    provider: None,
+                    base_url: Some(
+                        "https://relay.example/tenant/backend-api/codex/responses".to_string(),
+                    ),
+                    auth_mode: None,
+                    wire_api: None,
+                    api_key: None,
+                    is_active: None,
+                    priority: None,
+                },
+            )
+            .await
+            .expect("update Codex account");
+        assert_eq!(account.base_url, "https://relay.example/tenant/backend-api");
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn startup_migrates_only_legacy_codex_account_base_urls() {
+        let path =
+            std::env::temp_dir().join(format!("token-toxication-{}.sqlite3", Uuid::new_v4()));
+        let db = Db::open(&path).await.expect("open test database");
+        let legacy_codex = db
+            .create_provider_account(CreateProviderAccountRequest {
+                name: "Legacy Codex".to_string(),
+                provider: "codex-subscription".to_string(),
+                base_url: "https://relay.example/backend-api".to_string(),
+                auth_mode: "codex-oauth".to_string(),
+                wire_api: "openai-responses".to_string(),
+                api_key: "refresh-token-1".to_string(),
+                is_active: true,
+                priority: 0,
+            })
+            .await
+            .expect("create first Codex account");
+        let legacy_responses = db
+            .create_provider_account(CreateProviderAccountRequest {
+                name: "Legacy Responses".to_string(),
+                provider: "codex-subscription".to_string(),
+                base_url: "https://relay.example/tenant/backend-api".to_string(),
+                auth_mode: "codex-oauth".to_string(),
+                wire_api: "openai-responses".to_string(),
+                api_key: "refresh-token-2".to_string(),
+                is_active: true,
+                priority: 0,
+            })
+            .await
+            .expect("create second Codex account");
+        let bearer = db
+            .create_provider_account(CreateProviderAccountRequest {
+                name: "Bearer".to_string(),
+                provider: "openai".to_string(),
+                base_url: "https://relay.example/backend-api/codex".to_string(),
+                auth_mode: "bearer".to_string(),
+                wire_api: "openai-responses".to_string(),
+                api_key: "api-key".to_string(),
+                is_active: true,
+                priority: 0,
+            })
+            .await
+            .expect("create bearer account");
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE provider_accounts SET base_url = ?1 WHERE id = ?2",
+                rusqlite::params!["https://relay.example/backend-api/codex", legacy_codex.id],
+            )
+            .expect("seed legacy Codex URL");
+            conn.execute(
+                "UPDATE provider_accounts SET base_url = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    "https://relay.example/tenant/backend-api/codex/responses",
+                    legacy_responses.id
+                ],
+            )
+            .expect("seed legacy responses URL");
+        }
+        drop(db);
+
+        let db = Db::open(&path).await.expect("reopen migrated database");
+        assert_eq!(
+            db.get_provider_account(&legacy_codex.id)
+                .await
+                .expect("load first Codex account")
+                .expect("first Codex account")
+                .base_url,
+            "https://relay.example/backend-api"
+        );
+        assert_eq!(
+            db.get_provider_account(&legacy_responses.id)
+                .await
+                .expect("load second Codex account")
+                .expect("second Codex account")
+                .base_url,
+            "https://relay.example/tenant/backend-api"
+        );
+        assert_eq!(
+            db.get_provider_account(&bearer.id)
+                .await
+                .expect("load bearer account")
+                .expect("bearer account")
+                .base_url,
+            "https://relay.example/backend-api/codex"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

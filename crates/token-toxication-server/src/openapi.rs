@@ -4,6 +4,8 @@ use utoipa::OpenApi;
 use crate::models::{
     AdminUser, AnthropicModel, AnthropicModelListResponse, AntigravityOAuthStartRequest,
     AntigravityOAuthStartResponse, ApiKeyListResponse, ApiKeyResponse, ApiKeyView,
+    CodexAccountCredits, CodexAccountQuotaLimit, CodexAccountQuotaResponse,
+    CodexAccountQuotaWindow, CodexAccountSpendControl, CodexAccountSpendControlLimit,
     CreateApiKeyRequest, CreateApiKeyResponse, CreateModelCatalogEntryRequest,
     CreateProviderAccountRequest, CreateProviderModelRouteRequest, Dashboard, ErrorDetail,
     ErrorResponse, GeminiAccountModel, GeminiAccountModelsResponse, GeminiAccountQuota,
@@ -46,6 +48,7 @@ use crate::models::{
         antigravity_oauth_callback,
         get_gemini_account_models,
         get_gemini_account_quota,
+        get_codex_account_quota,
         list_model_catalog,
         create_model_catalog_entry,
         update_model_catalog_entry,
@@ -75,6 +78,12 @@ use crate::models::{
         ApiKeyListResponse,
         ApiKeyResponse,
         ApiKeyView,
+        CodexAccountCredits,
+        CodexAccountQuotaLimit,
+        CodexAccountQuotaResponse,
+        CodexAccountQuotaWindow,
+        CodexAccountSpendControl,
+        CodexAccountSpendControlLimit,
         CreateApiKeyRequest,
         CreateApiKeyResponse,
         CreateProviderAccountRequest,
@@ -333,6 +342,21 @@ pub fn get_gemini_account_models() {}
     ),
 )]
 pub fn get_gemini_account_quota() {}
+
+#[utoipa::path(
+    get,
+    path = "/admin/api/provider-accounts/{id}/codex/quota",
+    tag = "Admin",
+    params(("id" = String, Path, description = "Codex provider account id")),
+    responses(
+        (status = 200, description = "Codex subscription quota", body = CodexAccountQuotaResponse),
+        (status = 400, description = "Provider account does not use Codex OAuth", body = ErrorResponse),
+        (status = 401, description = "Codex OAuth credential is invalid", body = ErrorResponse),
+        (status = 404, description = "Provider account not found", body = ErrorResponse),
+        (status = 500, description = "Quota relay request failed", body = ErrorResponse),
+    ),
+)]
+pub fn get_codex_account_quota() {}
 
 #[utoipa::path(
     get,

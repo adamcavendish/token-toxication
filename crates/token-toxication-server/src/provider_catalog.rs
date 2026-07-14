@@ -52,7 +52,7 @@ const PROVIDER_PRESETS: &[ProviderPresetSpec] = &[
         label: "Codex subscription",
         name: "Codex subscription",
         provider: "codex-subscription",
-        base_url: "https://chatgpt.com/backend-api/codex",
+        base_url: "https://chatgpt.com/backend-api",
         auth_mode: "codex-oauth",
         wire_api: "openai-responses",
         credential_label: "Raw refresh token",

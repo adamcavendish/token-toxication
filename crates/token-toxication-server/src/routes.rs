@@ -27,7 +27,7 @@ use crate::{
     },
     auth::{extract_api_key, generate_secret, login, logout, me, require_admin},
     codex_subscription::{
-        CodexSubscriptionAuthorization, codex_subscription_authorization,
+        CodexSubscriptionAuthorization, codex_account_quota, codex_subscription_authorization,
         is_codex_subscription_auth,
     },
     error::AppError,
@@ -38,15 +38,16 @@ use crate::{
     models::{
         AnthropicModel, AnthropicModelListResponse, AntigravityOAuthStartRequest,
         AntigravityOAuthStartResponse, ApiKeyListResponse, ApiKeyRecord, ApiKeyResponse,
-        CreateApiKeyRequest, CreateApiKeyResponse, CreateModelCatalogEntryRequest,
-        CreateProviderAccountRequest, CreateProviderModelRouteRequest, Dashboard,
-        GeminiAccountModelsResponse, GeminiAccountQuotaResponse, GeminiModel,
-        GeminiModelListResponse, HealthResponse, MetricsResponse, ModelCatalogEntryResponse,
-        ModelCatalogListResponse, OpenAiModel, OpenAiModelListResponse,
-        ProviderAccountListResponse, ProviderAccountResponse, ProviderModelRouteListResponse,
-        ProviderModelRouteResponse, ProviderPresetListResponse, RequestLog, RequestLogListResponse,
-        RequestSummary, UpdateApiKeyRequest, UpdateModelCatalogEntryRequest,
-        UpdateProviderAccountRequest, UpdateProviderModelRouteRequest,
+        CodexAccountQuotaResponse, CreateApiKeyRequest, CreateApiKeyResponse,
+        CreateModelCatalogEntryRequest, CreateProviderAccountRequest,
+        CreateProviderModelRouteRequest, Dashboard, GeminiAccountModelsResponse,
+        GeminiAccountQuotaResponse, GeminiModel, GeminiModelListResponse, HealthResponse,
+        MetricsResponse, ModelCatalogEntryResponse, ModelCatalogListResponse, OpenAiModel,
+        OpenAiModelListResponse, ProviderAccountListResponse, ProviderAccountResponse,
+        ProviderModelRouteListResponse, ProviderModelRouteResponse, ProviderPresetListResponse,
+        RequestLog, RequestLogListResponse, RequestSummary, UpdateApiKeyRequest,
+        UpdateModelCatalogEntryRequest, UpdateProviderAccountRequest,
+        UpdateProviderModelRouteRequest,
     },
     provider_catalog::provider_presets,
     routing::{RouteFailure, classify_response_failure, classify_transport_failure},
@@ -79,6 +80,10 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route(
             "/provider-accounts/{id}/gemini/quota",
             get(get_gemini_account_quota),
+        )
+        .route(
+            "/provider-accounts/{id}/codex/quota",
+            get(get_codex_account_quota),
         )
         .route("/oauth/antigravity/start", post(start_antigravity_oauth))
         .route("/provider-presets", get(list_provider_presets))
@@ -1121,6 +1126,15 @@ pub async fn get_gemini_account_quota(
 ) -> Result<Json<GeminiAccountQuotaResponse>, AppError> {
     Ok(Json(
         gemini_account_quota(&state.db, &state.gemini_http, &id).await?,
+    ))
+}
+
+pub async fn get_codex_account_quota(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<CodexAccountQuotaResponse>, AppError> {
+    Ok(Json(
+        codex_account_quota(&state.db, &state.http, &id).await?,
     ))
 }
 

@@ -3,6 +3,7 @@ import type {
   AntigravityOAuthStartRequest,
   AntigravityOAuthStartResponse,
   ApiKey,
+  CodexAccountQuotaResponse,
   CreateApiKeyRequest,
   CreateApiKeyResponse,
   CreateModelCatalogEntryRequest,
@@ -166,6 +167,11 @@ export const api = {
 
   async geminiAccountQuota(id: string): Promise<GeminiAccountQuotaResponse> {
     const response = await callApi(adminApi.getGeminiAccountQuota({ id }));
+    return unwrapResult(response);
+  },
+
+  async codexAccountQuota(id: string): Promise<CodexAccountQuotaResponse> {
+    const response = await callApi(adminApi.getCodexAccountQuota({ id }));
     return unwrapResult(response);
   },
 

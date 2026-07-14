@@ -23,6 +23,8 @@ import { toast } from "sonner";
 import { api, clearStoredToken, getStoredToken, setStoredToken } from "./api";
 import type {
   ApiKey,
+  CodexAccountQuotaResponse,
+  CodexAccountQuotaWindow,
   Dashboard,
   GeminiAccountModelsResponse,
   GeminiAccountQuotaResponse,
@@ -134,6 +136,15 @@ type ClientModelOption = {
   displayName: string;
 };
 
+type CodexQuotaRow = {
+  limitId: string;
+  displayName: string;
+  windowName: string;
+  window: CodexAccountQuotaWindow | null;
+  allowed?: boolean | null;
+  limitReached?: boolean | null;
+};
+
 type AntigravityOAuthMessage = {
   type: "token-toxication:antigravity-oauth";
   success: boolean;
@@ -220,6 +231,10 @@ function App() {
   const [geminiQuota, setGeminiQuota] = useState<GeminiAccountQuotaResponse | null>(null);
   const [isGeminiDetailsLoading, setIsGeminiDetailsLoading] = useState(false);
   const [geminiDetailsError, setGeminiDetailsError] = useState<string | null>(null);
+  const [codexDetailsAccount, setCodexDetailsAccount] = useState<ProviderAccount | null>(null);
+  const [codexQuota, setCodexQuota] = useState<CodexAccountQuotaResponse | null>(null);
+  const [isCodexDetailsLoading, setIsCodexDetailsLoading] = useState(false);
+  const [codexDetailsError, setCodexDetailsError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     if (!getStoredToken()) {
@@ -419,6 +434,22 @@ function App() {
       toast.error(message);
     } finally {
       setIsGeminiDetailsLoading(false);
+    }
+  }
+
+  async function inspectCodexAccount(account: ProviderAccount) {
+    setCodexDetailsAccount(account);
+    setCodexQuota(null);
+    setCodexDetailsError(null);
+    setIsCodexDetailsLoading(true);
+    try {
+      setCodexQuota(await api.codexAccountQuota(account.id));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to load Codex quota";
+      setCodexDetailsError(message);
+      toast.error(message);
+    } finally {
+      setIsCodexDetailsLoading(false);
     }
   }
 
@@ -657,6 +688,7 @@ function App() {
                       routes={modelRoutes}
                       onCreate={() => setIsAccountSheetOpen(true)}
                       onToggle={toggleAccount}
+                      onInspectCodex={inspectCodexAccount}
                       onInspectGemini={inspectGeminiAccount}
                       onReconnectAntigravity={reconnectAntigravityAccount}
                     />
@@ -765,6 +797,13 @@ function App() {
         loading={isGeminiDetailsLoading}
         error={geminiDetailsError}
         onOpenChange={(open) => !open && setGeminiDetailsAccount(null)}
+      />
+      <CodexAccountDialog
+        account={codexDetailsAccount}
+        quota={codexQuota}
+        loading={isCodexDetailsLoading}
+        error={codexDetailsError}
+        onOpenChange={(open) => !open && setCodexDetailsAccount(null)}
       />
       <Toaster />
     </TooltipProvider>
@@ -1043,6 +1082,7 @@ function AccountsView({
   routes,
   onCreate,
   onToggle,
+  onInspectCodex,
   onInspectGemini,
   onReconnectAntigravity,
 }: {
@@ -1050,6 +1090,7 @@ function AccountsView({
   routes: ProviderModelRoute[];
   onCreate: () => void;
   onToggle: (account: ProviderAccount) => void;
+  onInspectCodex: (account: ProviderAccount) => void;
   onInspectGemini: (account: ProviderAccount) => void;
   onReconnectAntigravity: (account: ProviderAccount) => void;
 }) {
@@ -1090,6 +1131,22 @@ function AccountsView({
                   <TableCell>{statusBadge(account.status, account.isActive)}</TableCell>
                   <TableCell className="text-right">
                     <div className="flex justify-end gap-2">
+                      {isCodexAccount(account) ? (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="icon-sm"
+                              aria-label="Codex quota"
+                              onClick={() => onInspectCodex(account)}
+                            >
+                              <GaugeIcon />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Codex quota</TooltipContent>
+                        </Tooltip>
+                      ) : null}
                       {isGeminiAccount(account) ? (
                         <Tooltip>
                           <TooltipTrigger asChild>
@@ -1172,6 +1229,17 @@ function AccountsView({
                     {routeCountForAccount(routes, account.id)} routes
                   </span>
                   <div className="flex items-center gap-2">
+                    {isCodexAccount(account) ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon-sm"
+                        aria-label="Codex quota"
+                        onClick={() => onInspectCodex(account)}
+                      >
+                        <GaugeIcon />
+                      </Button>
+                    ) : null}
                     {isGeminiAccount(account) ? (
                       <Button
                         type="button"
@@ -1400,6 +1468,169 @@ function GeminiAccountDialog({
                         <EmptyNotice
                           title="No account models returned"
                           body="Google did not return models for this credential."
+                        />
+                      </TableCell>
+                    </TableRow>
+                  ) : null}
+                </TableBody>
+              </Table>
+            </div>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function CodexAccountDialog({
+  account,
+  quota,
+  loading,
+  error,
+  onOpenChange,
+}: {
+  account: ProviderAccount | null;
+  quota: CodexAccountQuotaResponse | null;
+  loading: boolean;
+  error: string | null;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const rows = useMemo<CodexQuotaRow[]>(() => {
+    const next: CodexQuotaRow[] = [];
+    quota?.limits.forEach((limit) => {
+      const windows = [
+        { name: "Primary", window: limit.primaryWindow },
+        { name: "Secondary", window: limit.secondaryWindow },
+      ].filter((entry): entry is { name: string; window: CodexAccountQuotaWindow } =>
+        Boolean(entry.window),
+      );
+      if (windows.length === 0) {
+        next.push({
+          limitId: limit.limitId,
+          displayName: limit.displayName,
+          windowName: "Unreported",
+          window: null,
+          allowed: limit.allowed,
+          limitReached: limit.limitReached,
+        });
+        return;
+      }
+      windows.forEach(({ name, window }) => {
+        next.push({
+          limitId: limit.limitId,
+          displayName: limit.displayName,
+          windowName: name,
+          window,
+          allowed: limit.allowed,
+          limitReached: limit.limitReached,
+        });
+      });
+    });
+    return next;
+  }, [quota]);
+  const spendLimit = quota?.spendControl?.individualLimit;
+
+  return (
+    <Dialog open={Boolean(account)} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[86svh] overflow-y-auto sm:max-w-4xl">
+        <DialogHeader>
+          <DialogTitle>{account?.name || "Codex account"}</DialogTitle>
+          <DialogDescription>Subscription quota reported by this Codex account.</DialogDescription>
+        </DialogHeader>
+        {loading ? (
+          <div className="grid gap-3">
+            <Skeleton className="h-16" />
+            <Skeleton className="h-52" />
+          </div>
+        ) : error ? (
+          <Alert variant="destructive">
+            <ActivityIcon className="size-4" />
+            <AlertTitle>Unable to load quota</AlertTitle>
+            <AlertDescription className="break-words">{error}</AlertDescription>
+          </Alert>
+        ) : (
+          <div className="flex min-w-0 flex-col gap-4">
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <SettingRow label="Plan" value={quota?.planType || "unknown"} />
+              <SettingRow label="Auth" value={quota?.authMode || account?.authMode || "unknown"} />
+              <SettingRow label="Limits" value={String(quota?.limits.length ?? 0)} />
+              <SettingRow
+                label="Reset credits"
+                value={formatOptionalNumber(quota?.resetCreditsAvailableCount)}
+              />
+            </div>
+            {quota?.endpoint ? <SettingRow label="Relay endpoint" value={quota.endpoint} /> : null}
+            {quota?.rateLimitReachedType ? (
+              <Alert variant="destructive">
+                <ActivityIcon className="size-4" />
+                <AlertTitle>Quota unavailable</AlertTitle>
+                <AlertDescription>
+                  {humanizeIdentifier(quota.rateLimitReachedType)}
+                </AlertDescription>
+              </Alert>
+            ) : null}
+            {quota?.credits || quota?.spendControl ? (
+              <div className="grid gap-3 sm:grid-cols-2">
+                {quota.credits ? (
+                  <SettingRow label="Credits" value={formatCodexCredits(quota.credits)} />
+                ) : null}
+                {quota.spendControl ? (
+                  <SettingRow
+                    label="Spending limit"
+                    value={formatCodexSpendControl(quota.spendControl.reached, spendLimit)}
+                  />
+                ) : null}
+              </div>
+            ) : null}
+            <div className="w-full min-w-0 max-w-full overflow-x-auto rounded-md border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Limit</TableHead>
+                    <TableHead>Window</TableHead>
+                    <TableHead className="min-w-48">Used</TableHead>
+                    <TableHead>Reset</TableHead>
+                    <TableHead>Status</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {rows.map((row) => {
+                    const usedPercent = codexUsedPercent(row.window?.usedPercent);
+                    return (
+                      <TableRow key={`${row.limitId}:${row.windowName}`}>
+                        <TableCell>
+                          <div className="font-medium">{row.displayName}</div>
+                          <div className="font-mono text-xs text-muted-foreground">
+                            {row.limitId}
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <div>{formatCodexWindow(row.window?.limitWindowSeconds)}</div>
+                          <div className="text-xs text-muted-foreground">{row.windowName}</div>
+                        </TableCell>
+                        <TableCell>
+                          {usedPercent === undefined ? (
+                            <span className="text-xs text-muted-foreground">unknown</span>
+                          ) : (
+                            <div className="flex min-w-40 items-center gap-3">
+                              <Progress value={usedPercent} className="min-w-24" />
+                              <span className="w-16 text-right font-mono text-xs">
+                                {formatQuotaPercent(usedPercent)}
+                              </span>
+                            </div>
+                          )}
+                        </TableCell>
+                        <TableCell>{formatQuotaReset(row.window?.resetAt)}</TableCell>
+                        <TableCell>{codexQuotaStatus(row.allowed, row.limitReached)}</TableCell>
+                      </TableRow>
+                    );
+                  })}
+                  {rows.length === 0 ? (
+                    <TableRow>
+                      <TableCell colSpan={5}>
+                        <EmptyNotice
+                          title="No quota windows returned"
+                          body="The relay returned no Codex quota windows."
                         />
                       </TableCell>
                     </TableRow>
@@ -2374,7 +2605,7 @@ function CreateAccountSheet({
           <Field
             label={
               isCodexSubscription
-                ? "Codex endpoint base"
+                ? "Codex account API base"
                 : isAntigravityAccount
                   ? "Gemini endpoint base"
                   : "Base URL"
@@ -3108,7 +3339,7 @@ function wireApiLabel(value: string) {
 
 function upstreamPathForWireApi(value: string, authMode?: string) {
   if (isCodexSubscriptionAuth(authMode ?? "")) {
-    return "/backend-api/codex/responses";
+    return "/codex/responses";
   }
   if (isAntigravityAccountAuth(authMode ?? "")) {
     return "/v1internal:generateContent";
@@ -3137,6 +3368,10 @@ function isGeminiAccount(account: ProviderAccount) {
   return account.provider === "gemini" && isAntigravityAccountAuth(account.authMode);
 }
 
+function isCodexAccount(account: ProviderAccount) {
+  return isCodexSubscriptionAuth(account.authMode);
+}
+
 function numberFromInput(value: string) {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
@@ -3162,6 +3397,96 @@ function formatQuotaPercent(value: number) {
     return "100%";
   }
   return `${value.toFixed(value >= 99 ? 3 : 1)}%`;
+}
+
+function codexUsedPercent(value: number | null | undefined) {
+  return value == null || !Number.isFinite(value) ? undefined : Math.max(0, Math.min(100, value));
+}
+
+function formatCodexWindow(seconds: number | null | undefined) {
+  if (seconds == null || !Number.isFinite(seconds) || seconds <= 0) {
+    return "unknown";
+  }
+  if (seconds >= 86_400) {
+    const days = Math.round(seconds / 86_400);
+    if (Math.abs(seconds - days * 86_400) <= 120) {
+      return `${days} ${days === 1 ? "day" : "days"}`;
+    }
+    return `${(seconds / 86_400).toFixed(1)} days`;
+  }
+  if (seconds >= 3_600) {
+    const hours = Math.round(seconds / 3_600);
+    if (Math.abs(seconds - hours * 3_600) <= 60) {
+      return `${hours} ${hours === 1 ? "hour" : "hours"}`;
+    }
+    return `${(seconds / 3_600).toFixed(1)} hours`;
+  }
+  if (seconds >= 60) {
+    const minutes = Math.round(seconds / 60);
+    return `${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
+  }
+  return `${seconds} ${seconds === 1 ? "second" : "seconds"}`;
+}
+
+function formatQuotaReset(value: string | null | undefined) {
+  return value ? formatDate(value) : "unknown";
+}
+
+function codexQuotaStatus(
+  allowed: boolean | null | undefined,
+  limitReached: boolean | null | undefined,
+) {
+  if (limitReached === true || allowed === false) {
+    return <Badge variant="destructive">limited</Badge>;
+  }
+  if (allowed === true) {
+    return <Badge variant="secondary">available</Badge>;
+  }
+  return <Badge variant="outline">unknown</Badge>;
+}
+
+function formatCodexCredits(credits: NonNullable<CodexAccountQuotaResponse["credits"]>) {
+  if (credits.unlimited) {
+    return "Unlimited";
+  }
+  if (credits.balance) {
+    return `Balance ${credits.balance}`;
+  }
+  if (credits.hasCredits === true) {
+    return "Available";
+  }
+  if (credits.hasCredits === false) {
+    return "None";
+  }
+  return "unknown";
+}
+
+function formatCodexSpendControl(
+  reached: boolean | null | undefined,
+  limit:
+    | NonNullable<NonNullable<CodexAccountQuotaResponse["spendControl"]>["individualLimit"]>
+    | null
+    | undefined,
+) {
+  if (!limit) {
+    return reached ? "Reached" : "unknown";
+  }
+  const amount =
+    limit.used && limit.limit
+      ? `${limit.used} / ${limit.limit}`
+      : limit.remaining
+        ? `${limit.remaining} remaining`
+        : "Configured";
+  return reached ? `${amount}, reached` : amount;
+}
+
+function formatOptionalNumber(value: number | null | undefined) {
+  return value == null ? "unknown" : formatNumber(value);
+}
+
+function humanizeIdentifier(value: string) {
+  const text = value.replaceAll("_", " ").trim();
+  return text ? `${text.charAt(0).toUpperCase()}${text.slice(1)}` : "Unknown";
 }
 
 function formatDate(value: string | null | undefined) {

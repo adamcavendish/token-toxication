@@ -300,6 +300,68 @@ pub struct GeminiAccountQuotaResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct CodexAccountQuotaWindow {
+    pub used_percent: Option<f64>,
+    pub limit_window_seconds: Option<i64>,
+    pub reset_after_seconds: Option<i64>,
+    pub reset_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAccountQuotaLimit {
+    pub limit_id: String,
+    pub display_name: String,
+    pub allowed: Option<bool>,
+    pub limit_reached: Option<bool>,
+    pub primary_window: Option<CodexAccountQuotaWindow>,
+    pub secondary_window: Option<CodexAccountQuotaWindow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAccountCredits {
+    pub has_credits: Option<bool>,
+    pub unlimited: Option<bool>,
+    pub balance: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAccountSpendControlLimit {
+    pub source: Option<String>,
+    pub limit: Option<String>,
+    pub used: Option<String>,
+    pub remaining: Option<String>,
+    pub used_percent: Option<f64>,
+    pub remaining_percent: Option<f64>,
+    pub reset_after_seconds: Option<i64>,
+    pub reset_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAccountSpendControl {
+    pub reached: Option<bool>,
+    pub individual_limit: Option<CodexAccountSpendControlLimit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAccountQuotaResponse {
+    pub account_id: String,
+    pub auth_mode: String,
+    pub endpoint: String,
+    pub plan_type: Option<String>,
+    pub limits: Vec<CodexAccountQuotaLimit>,
+    pub credits: Option<CodexAccountCredits>,
+    pub spend_control: Option<CodexAccountSpendControl>,
+    pub rate_limit_reached_type: Option<String>,
+    pub reset_credits_available_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderPreset {
     pub id: String,
     pub label: String,

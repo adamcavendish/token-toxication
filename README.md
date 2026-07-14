@@ -163,17 +163,24 @@ For Codex with an OpenAI API key, add an OpenAI provider account with base URL
 `https://api.openai.com`, Bearer auth, and `openai-responses`. For Codex with
 ChatGPT Plus or Pro subscriptions, add one `codex-subscription` provider account
 per subscription, use `codex-oauth`, set base URL
-`https://chatgpt.com/backend-api/codex`, and paste only the raw refresh token.
+`https://chatgpt.com/backend-api`, and paste only the raw refresh token.
 Do not paste the full auth JSON file. Codex CLI stores the token at
 `~/.codex/auth.json` under `tokens.refresh_token`; extract it with
 `jq -r '.tokens.refresh_token' ~/.codex/auth.json`. opencode stores the token at
 `~/.local/share/opencode/auth.json` under `openai.refresh`; extract it with
 `jq -r '.openai.refresh' ~/.local/share/opencode/auth.json`. The relay forwards
-those accounts to `{base_url}/responses` with refreshed ChatGPT OAuth bearer
+those accounts to `{base_url}/codex/responses` with refreshed ChatGPT OAuth bearer
 tokens. Configure routes normally: one subscription can be primary and other
 subscriptions can be backups. Configure Codex with a custom provider using base URL
 `http://localhost:3000/openai/v1`, wire API `responses`, and the generated
-`tokentoxication-...` key.
+`tokentoxication-...` key. Codex subscription accounts relay Responses requests
+to `{base_url}/codex/responses` and query quota from `{base_url}/wham/usage`.
+Legacy base URLs ending in `/codex` or `/codex/responses` remain supported.
+Existing Codex OAuth accounts using those legacy forms are migrated to the account
+API root when the database opens, and new account writes are canonicalized.
+The provider account row exposes the returned plan, usage windows, model-specific
+limits, credits, and reset times through
+`/admin/api/provider-accounts/{id}/codex/quota`.
 
 For DeepSeek v4, add a DeepSeek provider account with base URL
 `https://api.deepseek.com`, Bearer auth, and `openai-chat`. Use
