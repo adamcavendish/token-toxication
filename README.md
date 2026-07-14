@@ -175,6 +175,9 @@ subscriptions can be backups. Configure Codex with a custom provider using base 
 `http://localhost:3000/openai/v1`, wire API `responses`, and the generated
 `tokentoxication-...` key. Codex subscription accounts relay Responses requests
 to `{base_url}/codex/responses` and query quota from `{base_url}/wham/usage`.
+For `codex-oauth` routes, the relay automatically removes `max_output_tokens`
+because subscription endpoints follow the Codex CLI request shape. API-key
+Responses routes continue forwarding that public API parameter.
 The generated opencode config includes only models with eligible OpenAI Chat or
 Responses routes and selects the matching AI SDK for each model. When a model
 has both route types, the generated config prefers Responses.

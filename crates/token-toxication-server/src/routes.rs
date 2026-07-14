@@ -351,7 +351,12 @@ async fn relay_json_endpoint(
     let public_model_id = selection.public_model_id.clone();
     let upstream_model_id = selection.upstream_model_id.clone();
     request_json["model"] = Value::String(upstream_model_id.clone());
-    let stripped_params = strip_top_level_params(&mut request_json, &selection.strip_params);
+    let stripped_params = strip_upstream_params(
+        &mut request_json,
+        &selection.strip_params,
+        wire_api,
+        &selection.account.account.auth_mode,
+    );
     let body = serde_json::to_vec(&request_json)
         .map_err(|error| AppError::Internal(format!("serialize upstream request: {error}")))?;
     let request_summary = build_request_summary(&request_json, body.len() as u64, stripped_params);
@@ -1565,6 +1570,28 @@ fn strip_top_level_params(value: &mut Value, strip_params: &[String]) -> Vec<Str
     stripped
 }
 
+fn strip_upstream_params(
+    value: &mut Value,
+    configured_strip_params: &[String],
+    wire_api: WireApi,
+    auth_mode: &str,
+) -> Vec<String> {
+    let mut stripped = strip_top_level_params(value, configured_strip_params);
+    if wire_api != WireApi::OpenAiResponses || !is_codex_subscription_auth(auth_mode) {
+        return stripped;
+    }
+
+    // Codex subscription endpoints follow the Codex CLI request shape, which
+    // omits max_output_tokens even though the public Responses API accepts it.
+    let Some(object) = value.as_object_mut() else {
+        return stripped;
+    };
+    if object.remove("max_output_tokens").is_some() {
+        stripped.push("max_output_tokens".to_string());
+    }
+    stripped
+}
+
 fn build_request_summary(
     value: &Value,
     body_bytes: u64,
@@ -1771,6 +1798,54 @@ mod tests {
         assert_eq!(summary.top_level_keys, vec!["messages", "model", "stream"]);
         assert_eq!(summary.body_bytes, 123);
         assert!(summary.stream);
+    }
+
+    #[test]
+    fn codex_subscription_responses_strip_unsupported_max_output_tokens() {
+        let mut body = json!({
+            "model": "gpt-5",
+            "max_output_tokens": 32_000,
+            "input": "hello"
+        });
+
+        let stripped =
+            strip_upstream_params(&mut body, &[], WireApi::OpenAiResponses, "codex-oauth");
+
+        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(stripped, vec!["max_output_tokens"]);
+    }
+
+    #[test]
+    fn api_key_responses_preserve_max_output_tokens() {
+        let mut body = json!({
+            "model": "gpt-5",
+            "max_output_tokens": 32_000,
+            "input": "hello"
+        });
+
+        let stripped = strip_upstream_params(&mut body, &[], WireApi::OpenAiResponses, "bearer");
+
+        assert_eq!(body["max_output_tokens"], 32_000);
+        assert!(stripped.is_empty());
+    }
+
+    #[test]
+    fn codex_normalization_does_not_duplicate_configured_strip_params() {
+        let mut body = json!({
+            "model": "gpt-5",
+            "max_output_tokens": 32_000,
+            "input": "hello"
+        });
+
+        let stripped = strip_upstream_params(
+            &mut body,
+            &["max_output_tokens".to_string()],
+            WireApi::OpenAiResponses,
+            "codex-oauth",
+        );
+
+        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(stripped, vec!["max_output_tokens"]);
     }
 
     #[test]
