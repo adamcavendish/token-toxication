@@ -2231,8 +2231,17 @@ function RequestLogsView({
         </CardDescription>
       </CardHeader>
       <CardContent>
-        <div className="hidden md:block">
-          <Table>
+        <div className="hidden xl:block">
+          <Table className="table-fixed">
+            <colgroup>
+              <col className="w-32" />
+              <col className="w-[18%]" />
+              <col className="w-[14%]" />
+              <col />
+              <col className="w-20" />
+              <col className="w-24" />
+              <col className="w-24" />
+            </colgroup>
             <TableHeader>
               <TableRow>
                 <TableHead>Time</TableHead>
@@ -2247,29 +2256,100 @@ function RequestLogsView({
             <TableBody>
               {logs.map((log) => (
                 <TableRow key={log.id}>
-                  <TableCell>{formatDate(log.createdAt)}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {formatDate(log.createdAt)}
+                  </TableCell>
                   <TableCell>
-                    <div className="flex max-w-[280px] flex-col gap-1">
-                      <span className="truncate font-mono text-xs">{log.path}</span>
+                    <div className="flex min-w-0 flex-col gap-1">
+                      <span className="truncate font-mono text-xs" title={log.path}>
+                        {log.path}
+                      </span>
                       {log.upstreamUrl ? (
-                        <span className="truncate font-mono text-xs text-muted-foreground">
+                        <span
+                          className="truncate font-mono text-xs text-muted-foreground"
+                          title={log.upstreamUrl}
+                        >
                           {log.upstreamUrl}
                         </span>
                       ) : null}
                     </div>
                   </TableCell>
-                  <TableCell>{formatLogModel(log)}</TableCell>
-                  <TableCell className="max-w-[320px] text-xs text-muted-foreground">
-                    {formatRequestSummary(log)}
+                  <TableCell>
+                    <span className="block truncate" title={formatLogModel(log)}>
+                      {formatLogModel(log)}
+                    </span>
+                  </TableCell>
+                  <TableCell>
+                    <span
+                      className="block truncate text-xs text-muted-foreground"
+                      title={formatRequestSummary(log)}
+                    >
+                      {formatRequestSummary(log)}
+                    </span>
                   </TableCell>
                   <TableCell>{statusCodeBadge(log.statusCode)}</TableCell>
-                  <TableCell>{log.latencyMs}ms</TableCell>
-                  <TableCell>{formatNumber(log.inputTokens + log.outputTokens)}</TableCell>
+                  <TableCell className="text-right tabular-nums">{log.latencyMs}ms</TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    {formatNumber(log.inputTokens + log.outputTokens)}
+                  </TableCell>
                 </TableRow>
               ))}
               {logs.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={7}>
+                    <EmptyNotice
+                      title="No relay traffic"
+                      body="Requests appear here after clients call the relay."
+                    />
+                  </TableCell>
+                </TableRow>
+              ) : null}
+            </TableBody>
+          </Table>
+        </div>
+        <div className="hidden md:block xl:hidden">
+          <Table className="table-fixed">
+            <colgroup>
+              <col />
+              <col className="w-20" />
+              <col className="w-24" />
+              <col className="w-24" />
+            </colgroup>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Request</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead className="text-right">Latency</TableHead>
+                <TableHead className="text-right">Tokens</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {logs.map((log) => (
+                <TableRow key={log.id}>
+                  <TableCell className="whitespace-normal">
+                    <div className="min-w-0">
+                      <div className="truncate font-medium" title={formatLogModel(log)}>
+                        {formatLogModel(log)}
+                      </div>
+                      <div
+                        className="mt-1 truncate text-xs text-muted-foreground"
+                        title={formatRequestSummary(log)}
+                      >
+                        {formatRequestSummary(log)}
+                      </div>
+                      <RequestLogDetails log={log} />
+                    </div>
+                  </TableCell>
+                  <TableCell>{statusCodeBadge(log.statusCode)}</TableCell>
+                  <TableCell className="text-right tabular-nums">{log.latencyMs}ms</TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    {formatNumber(log.inputTokens + log.outputTokens)}
+                  </TableCell>
+                </TableRow>
+              ))}
+              {logs.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={4}>
                     <EmptyNotice
                       title="No relay traffic"
                       body="Requests appear here after clients call the relay."
@@ -2288,15 +2368,23 @@ function RequestLogsView({
             />
           ) : (
             logs.map((log) => (
-              <div key={log.id} className="flex flex-col gap-2 rounded-md border p-3">
+              <div key={log.id} className="flex flex-col gap-3 rounded-md border p-3">
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
-                    <div className="truncate font-mono text-xs">{log.path}</div>
-                    <div className="truncate text-xs text-muted-foreground">
+                    <div className="truncate font-mono text-xs" title={log.path}>
+                      {log.path}
+                    </div>
+                    <div
+                      className="truncate text-xs text-muted-foreground"
+                      title={formatLogModel(log)}
+                    >
                       {formatLogModel(log)}
                     </div>
                     {log.upstreamUrl ? (
-                      <div className="truncate font-mono text-xs text-muted-foreground">
+                      <div
+                        className="truncate font-mono text-xs text-muted-foreground"
+                        title={log.upstreamUrl}
+                      >
                         {log.upstreamUrl}
                       </div>
                     ) : null}
@@ -2305,16 +2393,58 @@ function RequestLogsView({
                 </div>
                 <div className="grid grid-cols-3 gap-2 text-xs text-muted-foreground">
                   <span>{formatDate(log.createdAt)}</span>
-                  <span>{log.latencyMs}ms</span>
-                  <span>{formatNumber(log.inputTokens + log.outputTokens)} tokens</span>
+                  <span className="text-right tabular-nums">{log.latencyMs}ms</span>
+                  <span className="text-right tabular-nums">
+                    {formatNumber(log.inputTokens + log.outputTokens)} tokens
+                  </span>
                 </div>
-                <div className="text-xs text-muted-foreground">{formatRequestSummary(log)}</div>
+                <div className="break-words text-xs leading-5 text-muted-foreground">
+                  {formatRequestSummary(log)}
+                </div>
               </div>
             ))
           )}
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+function RequestLogDetails({ log }: { log: RequestLog }) {
+  return (
+    <details className="group mt-2 text-xs text-muted-foreground">
+      <summary className="w-fit cursor-pointer list-none text-foreground underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+        Routing details
+      </summary>
+      <dl className="mt-2 grid gap-1 border-l pl-3">
+        <div className="flex gap-2">
+          <dt className="shrink-0">Time</dt>
+          <dd>{formatDate(log.createdAt)}</dd>
+        </div>
+        <div className="flex min-w-0 gap-2">
+          <dt className="shrink-0">Path</dt>
+          <dd className="min-w-0 truncate font-mono" title={log.path}>
+            {log.path}
+          </dd>
+        </div>
+        {log.upstreamUrl ? (
+          <div className="flex min-w-0 gap-2">
+            <dt className="shrink-0">Upstream</dt>
+            <dd className="min-w-0 truncate font-mono" title={log.upstreamUrl}>
+              {log.upstreamUrl}
+            </dd>
+          </div>
+        ) : null}
+        {log.error ? (
+          <div className="flex min-w-0 gap-2 text-destructive">
+            <dt className="shrink-0">Error</dt>
+            <dd className="min-w-0 truncate" title={log.error}>
+              {log.error}
+            </dd>
+          </div>
+        ) : null}
+      </dl>
+    </details>
   );
 }
 
