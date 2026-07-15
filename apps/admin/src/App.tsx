@@ -860,7 +860,9 @@ function Overview({
           <CardHeader className="flex-row items-start justify-between gap-4">
             <div className="flex flex-col gap-1">
               <CardTitle>Request flow</CardTitle>
-              <CardDescription>Completed relay requests during the last hour.</CardDescription>
+              <CardDescription>
+                Completed relay requests across clock-aligned intervals.
+              </CardDescription>
             </div>
             <Button type="button" onClick={onCreateKey}>
               <PlusIcon data-icon="inline-start" />
@@ -3147,7 +3149,11 @@ function TrendChart({ trend }: { trend: RequestTrend }) {
   });
   const points = pointPositions.map(({ x, y }) => `${x},${y}`).join(" ");
   const total = values.reduce((sum, value) => sum + value, 0);
-  const average = values.length > 0 ? total / values.length : 0;
+  const completedValues = values.slice(0, -1);
+  const completedAverage =
+    completedValues.length > 0
+      ? completedValues.reduce((sum, value) => sum + value, 0) / completedValues.length
+      : 0;
   const intervalMinutes = Math.round(trend.bucketDurationSeconds / 60);
   const firstBucket = trend.buckets[0];
   const middleBucket = trend.buckets[Math.floor((trend.buckets.length - 1) / 2)];
@@ -3162,7 +3168,9 @@ function TrendChart({ trend }: { trend: RequestTrend }) {
               Each point counts completed requests in one interval. Hover or focus for details.
             </p>
           </div>
-          <Badge variant="outline">Last hour</Badge>
+          <Badge variant="outline">
+            {values.length} × {intervalMinutes} min
+          </Badge>
         </div>
 
         <div className="mt-4 grid grid-cols-[2.5rem_minmax(0,1fr)] gap-x-2">
@@ -3180,7 +3188,7 @@ function TrendChart({ trend }: { trend: RequestTrend }) {
               preserveAspectRatio="none"
               className="pointer-events-none absolute inset-0 h-full w-full text-foreground/70"
               role="img"
-              aria-label={`Request counts in ${intervalMinutes}-minute intervals during the last hour`}
+              aria-label={`Request counts across ${values.length} clock-aligned ${intervalMinutes}-minute intervals`}
             >
               {[chartTop, 50, chartBottom].map((y) => (
                 <line
@@ -3251,15 +3259,16 @@ function TrendChart({ trend }: { trend: RequestTrend }) {
         </div>
 
         <p className="mt-3 text-xs text-muted-foreground">
-          The rightmost interval is still in progress, so its count may increase.
+          Intervals align to local {intervalMinutes}-minute boundaries. The rightmost interval is
+          still in progress, so its count is excluded from the average.
         </p>
       </div>
       <div className="grid gap-3 md:grid-cols-3">
-        <ChartStat label="Last-hour total" value={formatNumber(total)} />
+        <ChartStat label="Window total" value={formatNumber(total)} />
         <ChartStat label={`Peak / ${intervalMinutes} min`} value={formatNumber(peak)} />
         <ChartStat
-          label={`Average / ${intervalMinutes} min`}
-          value={average.toLocaleString(undefined, { maximumFractionDigits: 1 })}
+          label={`Completed avg / ${intervalMinutes} min`}
+          value={completedAverage.toLocaleString(undefined, { maximumFractionDigits: 1 })}
         />
       </div>
     </div>
