@@ -9,6 +9,7 @@ pub mod gemini_code_assist;
 pub mod models;
 pub mod openapi;
 pub mod provider_catalog;
+pub(crate) mod relay_attempt;
 pub mod routes;
 pub mod routing;
 pub mod server;
