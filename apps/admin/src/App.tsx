@@ -828,7 +828,7 @@ function Overview({
 }) {
   return (
     <div className="flex flex-col gap-5">
-      <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+      <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
         <MetricCard
           title="Requests today"
           value={formatNumber(dashboard.usage.requestsToday)}
@@ -840,6 +840,15 @@ function Overview({
           value={formatNumber(dashboard.usage.tokensToday)}
           detail={`${formatNumber(dashboard.usage.totalTokens)} total`}
           icon={TerminalSquareIcon}
+        />
+        <MetricCard
+          title="Cache hit rate"
+          value={formatCacheHitRate(
+            dashboard.usage.cachedInputTokensToday,
+            dashboard.usage.inputTokensToday,
+          )}
+          detail={`${formatNumber(dashboard.usage.cachedInputTokensToday)} / ${formatNumber(dashboard.usage.inputTokensToday)} input tokens`}
+          icon={GaugeIcon}
         />
         <MetricCard
           title="Active API keys"
@@ -2267,6 +2276,7 @@ function RequestLogsView({
               <col className="w-20" />
               <col className="w-24" />
               <col className="w-24" />
+              <col className="w-24" />
             </colgroup>
             <TableHeader>
               <TableRow>
@@ -2276,7 +2286,8 @@ function RequestLogsView({
                 <TableHead>Request</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Latency</TableHead>
-                <TableHead>Tokens</TableHead>
+                <TableHead className="text-right">Tokens</TableHead>
+                <TableHead className="text-right">Cache hit</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -2318,11 +2329,14 @@ function RequestLogsView({
                   <TableCell className="text-right tabular-nums">
                     {formatNumber(log.inputTokens + log.outputTokens)}
                   </TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    {formatCacheHitRate(log.cachedInputTokens, log.inputTokens)}
+                  </TableCell>
                 </TableRow>
               ))}
               {logs.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={7}>
+                  <TableCell colSpan={8}>
                     <EmptyNotice
                       title="No relay traffic"
                       body="Requests appear here after clients call the relay."
@@ -2340,6 +2354,7 @@ function RequestLogsView({
               <col className="w-20" />
               <col className="w-24" />
               <col className="w-24" />
+              <col className="w-24" />
             </colgroup>
             <TableHeader>
               <TableRow>
@@ -2347,6 +2362,7 @@ function RequestLogsView({
                 <TableHead>Status</TableHead>
                 <TableHead className="text-right">Latency</TableHead>
                 <TableHead className="text-right">Tokens</TableHead>
+                <TableHead className="text-right">Cache hit</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -2371,11 +2387,14 @@ function RequestLogsView({
                   <TableCell className="text-right tabular-nums">
                     {formatNumber(log.inputTokens + log.outputTokens)}
                   </TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    {formatCacheHitRate(log.cachedInputTokens, log.inputTokens)}
+                  </TableCell>
                 </TableRow>
               ))}
               {logs.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={4}>
+                  <TableCell colSpan={5}>
                     <EmptyNotice
                       title="No relay traffic"
                       body="Requests appear here after clients call the relay."
@@ -2421,7 +2440,12 @@ function RequestLogsView({
                   <span>{formatDate(log.createdAt)}</span>
                   <span className="text-right tabular-nums">{log.latencyMs}ms</span>
                   <span className="text-right tabular-nums">
-                    {formatNumber(log.inputTokens + log.outputTokens)} tokens
+                    <span className="block">
+                      {formatNumber(log.inputTokens + log.outputTokens)} tokens
+                    </span>
+                    <span className="block">
+                      {formatCacheHitRate(log.cachedInputTokens, log.inputTokens)} cache hit
+                    </span>
                   </span>
                 </div>
                 <div className="break-words text-xs leading-5 text-muted-foreground">
@@ -2461,6 +2485,13 @@ function RequestLogDetails({ log }: { log: RequestLog }) {
             </dd>
           </div>
         ) : null}
+        <div className="flex gap-2">
+          <dt className="shrink-0">Tokens</dt>
+          <dd>
+            {formatNumber(log.inputTokens)} input · {formatNumber(log.cachedInputTokens)} cached ·{" "}
+            {formatNumber(log.outputTokens)} output
+          </dd>
+        </div>
         {log.error ? (
           <div className="flex min-w-0 gap-2 text-destructive">
             <dt className="shrink-0">Error</dt>
@@ -3640,6 +3671,14 @@ function numberFromInput(value: string) {
 
 function formatNumber(value: number) {
   return new Intl.NumberFormat().format(value);
+}
+
+function formatCacheHitRate(cachedInputTokens: number, inputTokens: number) {
+  const rate = inputTokens > 0 ? cachedInputTokens / inputTokens : 0;
+  return new Intl.NumberFormat(undefined, {
+    style: "percent",
+    maximumFractionDigits: 1,
+  }).format(rate);
 }
 
 function niceChartMaximum(value: number) {

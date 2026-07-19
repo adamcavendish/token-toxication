@@ -1,5 +1,7 @@
+use std::io;
+
 use aioduct::{
-    RequestBuilderSend,
+    RequestBuilderSend, SseDecoder, SseEvent,
     runtime::{ConnectorSend, RuntimePoll},
 };
 use axum::{
@@ -11,10 +13,12 @@ use axum::{
     response::{Html, Response},
     routing::{get, patch, post},
 };
+use bytes::BytesMut;
 use chrono::Utc;
-use futures_util::stream;
+use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 
 use crate::{
     AppState,
@@ -47,7 +51,7 @@ use crate::{
         UpdateProviderModelRouteRequest,
     },
     provider_catalog::provider_presets,
-    relay_attempt::{RelayAttempt, RelayAttemptLog, authenticate_relay_api_key},
+    relay_attempt::{RelayAttempt, RelayAttemptLog, TokenUsage, authenticate_relay_api_key},
     routing::{RouteFailure, classify_transport_failure},
 };
 
@@ -340,6 +344,7 @@ async fn relay_json_endpoint(
     let strip_params = attempt.selection().strip_params.clone();
     let account = attempt.selection().account.clone();
     request_json["model"] = Value::String(upstream_model_id.clone());
+    enable_stream_usage_if_supported(&mut request_json, wire_api, &account.account.provider);
     let stripped_params = strip_upstream_params(
         &mut request_json,
         &strip_params,
@@ -439,15 +444,14 @@ async fn relay_json_endpoint(
         .unwrap_or(false);
 
     if is_stream {
-        attempt
-            .record_response(&log, status, &response_headers, b"", 0, 0)
-            .await?;
         let body_stream = stream::unfold(response.into_bytes_stream(), |mut body| async move {
             body.next().await.map(|chunk| {
                 let chunk = chunk.map_err(std::io::Error::other);
                 (chunk, body)
             })
         });
+        let body_stream =
+            record_streaming_response(body_stream, attempt, log, status, response_headers);
         let body = Body::from_stream(body_stream);
         let mut relay = Response::builder()
             .status(status)
@@ -463,7 +467,7 @@ async fn relay_json_endpoint(
         let bytes = response.bytes().await?;
         let usage = parse_usage(&bytes);
         attempt
-            .record_response(&log, status, &response_headers, &bytes, usage.0, usage.1)
+            .record_response(&log, status, &response_headers, &bytes, usage)
             .await?;
         let mut relay = Response::builder()
             .status(status)
@@ -585,9 +589,6 @@ async fn relay_gemini_endpoint(
         .unwrap_or_else(|| HeaderValue::from_static("application/json"));
 
     if method.is_stream() {
-        attempt
-            .record_response(&log, status, &response_headers, b"", 0, 0)
-            .await?;
         let body_stream = stream::unfold(
             (
                 response.into_bytes_stream(),
@@ -625,6 +626,8 @@ async fn relay_gemini_endpoint(
                 }
             },
         );
+        let body_stream =
+            record_streaming_response(body_stream, attempt, log, status, response_headers);
         let body = Body::from_stream(body_stream);
         let mut relay = Response::builder()
             .status(status)
@@ -650,14 +653,7 @@ async fn relay_gemini_endpoint(
             upstream_bytes.as_ref()
         };
         attempt
-            .record_response(
-                &log,
-                status,
-                &response_headers,
-                health_body,
-                usage.0,
-                usage.1,
-            )
+            .record_response(&log, status, &response_headers, health_body, usage)
             .await?;
         let mut relay = Response::builder()
             .status(status)
@@ -1290,35 +1286,244 @@ fn forwarded_anthropic_version(headers: &HeaderMap) -> HeaderValue {
         .unwrap_or_else(|| HeaderValue::from_static(DEFAULT_ANTHROPIC_VERSION))
 }
 
-fn parse_usage(bytes: &[u8]) -> (u64, u64) {
-    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
-        return (0, 0);
+fn enable_stream_usage_if_supported(request: &mut Value, wire_api: WireApi, provider: &str) {
+    if wire_api != WireApi::OpenAiChat
+        || provider != "openai"
+        || request.get("stream").and_then(Value::as_bool) != Some(true)
+    {
+        return;
+    }
+
+    let Some(request) = request.as_object_mut() else {
+        return;
     };
-    let Some(usage) = value.get("usage") else {
-        if let Some(usage) = value.get("usageMetadata") {
-            let input = usage
-                .get("promptTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let output = usage
-                .get("candidatesTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            return (input, output);
+    let stream_options = request.entry("stream_options").or_insert_with(|| json!({}));
+    if let Some(stream_options) = stream_options.as_object_mut() {
+        stream_options
+            .entry("include_usage")
+            .or_insert(Value::Bool(true));
+    }
+}
+
+enum StreamEnd {
+    Complete,
+    UpstreamError(io::Error),
+    ClientDisconnected,
+}
+
+fn record_streaming_response<S>(
+    body_stream: S,
+    attempt: RelayAttempt,
+    log: RelayAttemptLog,
+    status: StatusCode,
+    response_headers: HeaderMap,
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
+{
+    const BUFFERED_CHUNKS: usize = 1;
+
+    // The owned task can finalize the attempt after upstream EOF while the
+    // bounded channel preserves downstream backpressure.
+    let (sender, receiver) = mpsc::channel(BUFFERED_CHUNKS);
+    tokio::spawn(async move {
+        let mut body_stream = Box::pin(body_stream);
+        let mut usage = StreamingUsage::default();
+        let stream_end = loop {
+            let next = tokio::select! {
+                _ = sender.closed() => break StreamEnd::ClientDisconnected,
+                next = body_stream.next() => next,
+            };
+            match next {
+                Some(Ok(chunk)) => {
+                    usage.observe(&chunk);
+                    if sender.send(Ok(chunk)).await.is_err() {
+                        break StreamEnd::ClientDisconnected;
+                    }
+                }
+                Some(Err(error)) => break StreamEnd::UpstreamError(error),
+                None => break StreamEnd::Complete,
+            }
+        };
+
+        match stream_end {
+            StreamEnd::UpstreamError(error) => {
+                let failure = classify_transport_failure(error.to_string(), Utc::now());
+                if let Err(record_error) = attempt.record_failure(&log, failure).await {
+                    tracing::error!(
+                        error = %record_error,
+                        path = %log.path,
+                        "failed to record upstream stream failure"
+                    );
+                }
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+            StreamEnd::ClientDisconnected => {
+                if let Err(error) = attempt.record_client_disconnect(&log, usage.tokens()).await {
+                    tracing::error!(
+                        %error,
+                        path = %log.path,
+                        "failed to record client-disconnected stream"
+                    );
+                }
+                return;
+            }
+            StreamEnd::Complete => {}
         }
-        return (0, 0);
+
+        let usage = usage.tokens();
+        if let Err(error) = attempt
+            .record_response(&log, status, &response_headers, b"", usage)
+            .await
+        {
+            tracing::error!(%error, path = %log.path, "failed to record streaming response");
+            let _ = sender.send(Err(io::Error::other(error))).await;
+        }
+    });
+
+    stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    })
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct UsageUpdate {
+    input_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+
+impl UsageUpdate {
+    fn merge(&mut self, update: Self) {
+        if update.input_tokens.is_some() {
+            self.input_tokens = update.input_tokens;
+        }
+        if update.cached_input_tokens.is_some() {
+            self.cached_input_tokens = update.cached_input_tokens;
+        }
+        if update.cache_read_input_tokens.is_some() {
+            self.cache_read_input_tokens = update.cache_read_input_tokens;
+        }
+        if update.cache_creation_input_tokens.is_some() {
+            self.cache_creation_input_tokens = update.cache_creation_input_tokens;
+        }
+        if update.output_tokens.is_some() {
+            self.output_tokens = update.output_tokens;
+        }
+    }
+
+    fn tokens(self) -> TokenUsage {
+        let mut input_tokens = self.input_tokens.unwrap_or(0);
+        let cached_input_tokens = self
+            .cache_read_input_tokens
+            .or(self.cached_input_tokens)
+            .unwrap_or(0);
+
+        // Anthropic reports uncached input, cache reads, and cache writes as
+        // separate values. Other supported APIs include cache hits in their
+        // input-token total already.
+        if self.cache_read_input_tokens.is_some() || self.cache_creation_input_tokens.is_some() {
+            input_tokens = input_tokens
+                .saturating_add(cached_input_tokens)
+                .saturating_add(self.cache_creation_input_tokens.unwrap_or(0));
+        }
+
+        TokenUsage {
+            input_tokens,
+            cached_input_tokens,
+            output_tokens: self.output_tokens.unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StreamingUsage {
+    decoder: SseDecoder,
+    buffer: BytesMut,
+    usage: UsageUpdate,
+}
+
+impl Default for StreamingUsage {
+    fn default() -> Self {
+        Self {
+            // Responses completion events can contain the full generated
+            // response, so the default 512 KiB SSE limit is too small.
+            decoder: SseDecoder::with_max_payload_size(0),
+            buffer: BytesMut::new(),
+            usage: UsageUpdate::default(),
+        }
+    }
+}
+
+impl StreamingUsage {
+    fn observe(&mut self, chunk: &[u8]) {
+        self.buffer.extend_from_slice(chunk);
+        while let Some(event) = self.decoder.decode(&mut self.buffer) {
+            let Ok(SseEvent::Message(message)) = event else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&message.data) else {
+                continue;
+            };
+            self.usage.merge(usage_update(&value));
+        }
+    }
+
+    fn tokens(&self) -> TokenUsage {
+        self.usage.tokens()
+    }
+}
+
+fn parse_usage(bytes: &[u8]) -> TokenUsage {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return TokenUsage::default();
     };
-    let input = usage
-        .get("input_tokens")
-        .or_else(|| usage.get("prompt_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output = usage
-        .get("output_tokens")
-        .or_else(|| usage.get("completion_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    (input, output)
+    usage_update(&value).tokens()
+}
+
+fn usage_update(value: &Value) -> UsageUpdate {
+    let mut update = UsageUpdate::default();
+    for usage in [
+        value.get("usage"),
+        value.get("usageMetadata"),
+        value.pointer("/response/usage"),
+        value.pointer("/response/usageMetadata"),
+        value.pointer("/message/usage"),
+        value.pointer("/message/usageMetadata"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        update.merge(UsageUpdate {
+            input_tokens: token_field(
+                usage,
+                &["input_tokens", "prompt_tokens", "promptTokenCount"],
+            ),
+            cached_input_tokens: token_field(usage, &["cachedContentTokenCount"])
+                .or_else(|| nested_token_field(usage, "input_tokens_details", "cached_tokens"))
+                .or_else(|| nested_token_field(usage, "prompt_tokens_details", "cached_tokens")),
+            cache_read_input_tokens: token_field(usage, &["cache_read_input_tokens"]),
+            cache_creation_input_tokens: token_field(usage, &["cache_creation_input_tokens"]),
+            output_tokens: token_field(
+                usage,
+                &["output_tokens", "completion_tokens", "candidatesTokenCount"],
+            ),
+        });
+    }
+    update
+}
+
+fn nested_token_field(value: &Value, object: &str, field: &str) -> Option<u64> {
+    value.get(object)?.get(field)?.as_u64()
+}
+
+fn token_field(value: &Value, names: &[&str]) -> Option<u64> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_u64))
 }
 
 async fn openai_models(state: &AppState) -> Result<Vec<OpenAiModel>, AppError> {
@@ -1418,7 +1623,7 @@ fn validate_provider_model_route_input(
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+    use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
     use super::*;
     use aioduct::TokioClient;
@@ -1640,7 +1845,11 @@ mod tests {
                         StatusCode::OK,
                         Json(json!({
                             "id": "chat-1",
-                            "usage": {"prompt_tokens": 3, "completion_tokens": 5}
+                            "usage": {
+                                "prompt_tokens": 3,
+                                "prompt_tokens_details": {"cached_tokens": 2},
+                                "completion_tokens": 5
+                            }
                         })),
                     )
                 }
@@ -1720,6 +1929,7 @@ mod tests {
             Some("upstream-chat-model")
         );
         assert_eq!((logs[0].input_tokens, logs[0].output_tokens), (3, 5));
+        assert_eq!(logs[0].cached_input_tokens, 2);
         assert!(logs[0].error.is_none());
         assert_eq!(
             state
@@ -1741,6 +1951,188 @@ mod tests {
                 .last_status_code,
             Some(200)
         );
+
+        drop(state);
+        remove_test_database(&database_path);
+    }
+
+    #[tokio::test]
+    async fn streamed_openai_responses_record_completion_usage() {
+        const STREAM: &str = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":13,\"input_tokens_details\":{\"cached_tokens\":10},\"output_tokens\":8,\"total_tokens\":21}}}\n\n"
+        );
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                let chunks = stream::iter([
+                    Ok::<_, Infallible>(Bytes::from_static(
+                        b"event: response.completed\ndata: {\"type\":\"response.comp",
+                    )),
+                    Ok(Bytes::from_static(
+                        b"leted\",\"response\":{\"usage\":{\"input_tok",
+                    )),
+                    Ok(Bytes::from_static(
+                        b"ens\":13,\"input_tokens_details\":{\"cached_tokens\":10},\"output_tokens\":8,\"total_tokens\":21}}}\n\n",
+                    )),
+                ]);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(chunks))
+                    .expect("build upstream response")
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let address = listener.local_addr().expect("upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("serve upstream");
+        });
+
+        let database_path = test_database_path();
+        let db = Db::open(&database_path).await.expect("open test database");
+        let SeededRelayRoute { relay_secret, .. } = seed_relay_route(
+            &db,
+            RelayRouteSeed {
+                base_url: format!("http://{address}"),
+                provider: "openai-compatible",
+                auth_mode: "bearer",
+                provider_secret: "provider-secret".to_string(),
+                wire_api: "openai-responses",
+                public_model: "public-responses-model",
+                upstream_model: "upstream-responses-model",
+            },
+        )
+        .await;
+        let state = test_state(db, database_path.clone());
+
+        let response = relay_openai_responses(
+            State(state.clone()),
+            relay_headers(&relay_secret),
+            Uri::from_static("/openai/v1/responses"),
+            Bytes::from_static(
+                br#"{"model":"public-responses-model","input":"hello","stream":true}"#,
+            ),
+        )
+        .await
+        .expect("relay response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let relay_body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read relay response");
+        assert_eq!(relay_body.as_ref(), STREAM.as_bytes());
+        server.abort();
+
+        let logs = state
+            .db
+            .list_request_logs(1)
+            .await
+            .expect("list request logs");
+        assert_eq!(logs.len(), 1);
+        assert_eq!((logs[0].input_tokens, logs[0].output_tokens), (13, 8));
+        assert_eq!(logs[0].cached_input_tokens, 10);
+
+        drop(state);
+        remove_test_database(&database_path);
+    }
+
+    #[tokio::test]
+    async fn disconnected_stream_is_recorded_without_penalizing_the_route() {
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                let chunks = stream::once(async {
+                    Ok::<_, Infallible>(Bytes::from_static(b"data: {}\n\n"))
+                })
+                .chain(stream::pending());
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(chunks))
+                    .expect("build upstream response")
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let address = listener.local_addr().expect("upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("serve upstream");
+        });
+
+        let database_path = test_database_path();
+        let db = Db::open(&database_path).await.expect("open test database");
+        let SeededRelayRoute {
+            relay_secret,
+            route_id,
+            ..
+        } = seed_relay_route(
+            &db,
+            RelayRouteSeed {
+                base_url: format!("http://{address}"),
+                provider: "openai-compatible",
+                auth_mode: "bearer",
+                provider_secret: "provider-secret".to_string(),
+                wire_api: "openai-responses",
+                public_model: "public-responses-model",
+                upstream_model: "upstream-responses-model",
+            },
+        )
+        .await;
+        let state = test_state(db, database_path.clone());
+
+        let response = relay_openai_responses(
+            State(state.clone()),
+            relay_headers(&relay_secret),
+            Uri::from_static("/openai/v1/responses"),
+            Bytes::from_static(
+                br#"{"model":"public-responses-model","input":"hello","stream":true}"#,
+            ),
+        )
+        .await
+        .expect("relay response");
+        let mut body = response.into_body().into_data_stream();
+        body.next()
+            .await
+            .expect("first response chunk")
+            .expect("valid response chunk");
+        drop(body);
+
+        let mut logs = Vec::new();
+        for _ in 0..20 {
+            logs = state
+                .db
+                .list_request_logs(1)
+                .await
+                .expect("list request logs");
+            if !logs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        server.abort();
+
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status_code, 499);
+        assert_eq!(logs[0].cached_input_tokens, 0);
+        assert_eq!(
+            logs[0].error.as_deref(),
+            Some("client disconnected before the upstream stream completed")
+        );
+        let route = state
+            .db
+            .get_provider_model_route(&route_id)
+            .await
+            .expect("get provider route")
+            .expect("provider route");
+        assert_eq!(route.status, "healthy");
+        assert_eq!(route.last_status_code, None);
 
         drop(state);
         remove_test_database(&database_path);
@@ -1808,6 +2200,7 @@ mod tests {
             .expect("list request logs");
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].status_code, 429);
+        assert_eq!(logs[0].cached_input_tokens, 0);
         assert_eq!(logs[0].error.as_deref(), Some("upstream returned 429"));
         let route = state
             .db
@@ -1841,6 +2234,7 @@ mod tests {
                                 "candidates": [{"content": {"parts": [{"text": "hello"}]}}],
                                 "usageMetadata": {
                                     "promptTokenCount": 11,
+                                    "cachedContentTokenCount": 6,
                                     "candidatesTokenCount": 7
                                 }
                             }
@@ -1913,6 +2307,7 @@ mod tests {
             Some("upstream-gemini-model")
         );
         assert_eq!((logs[0].input_tokens, logs[0].output_tokens), (11, 7));
+        assert_eq!(logs[0].cached_input_tokens, 6);
         assert!(logs[0].error.is_none());
         assert_eq!(
             state
@@ -1934,6 +2329,70 @@ mod tests {
                 .last_status_code,
             Some(200)
         );
+
+        drop(state);
+        remove_test_database(&database_path);
+    }
+
+    #[tokio::test]
+    async fn streamed_gemini_relay_records_usage() {
+        let upstream = Router::new().route(
+            "/v1internal:streamGenerateContent",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    concat!(
+                        "data: {\"traceId\":\"gemini-stream-1\",\"response\":{",
+                        "\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}],",
+                        "\"usageMetadata\":{\"promptTokenCount\":11,\"cachedContentTokenCount\":6,\"candidatesTokenCount\":7}}}\n\n"
+                    ),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let address = listener.local_addr().expect("upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("serve upstream");
+        });
+
+        let database_path = test_database_path();
+        let db = Db::open(&database_path).await.expect("open test database");
+        let SeededRelayRoute { relay_secret, .. } =
+            seed_relay_route(&db, gemini_relay_route_seed(address)).await;
+        let state = test_state(db, database_path.clone());
+
+        let response = relay_gemini_generate_content(
+            State(state.clone()),
+            relay_headers(&relay_secret),
+            Uri::from_static("/gemini/v1beta/models/public-gemini-model:streamGenerateContent"),
+            axum::extract::Path("public-gemini-model:streamGenerateContent".to_string()),
+            Bytes::from_static(br#"{"contents":[{"parts":[{"text":"hello"}]}]}"#),
+        )
+        .await
+        .expect("relay response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let relay_body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read relay response");
+        server.abort();
+
+        let relay_body = String::from_utf8(relay_body.to_vec()).expect("decode relay stream");
+        assert!(relay_body.contains(r#""responseId":"gemini-stream-1""#));
+        assert!(relay_body.contains(r#""promptTokenCount":11"#));
+
+        let logs = state
+            .db
+            .list_request_logs(1)
+            .await
+            .expect("list request logs");
+        assert_eq!(logs.len(), 1);
+        assert_eq!((logs[0].input_tokens, logs[0].output_tokens), (11, 7));
+        assert_eq!(logs[0].cached_input_tokens, 6);
 
         drop(state);
         remove_test_database(&database_path);
@@ -2038,6 +2497,24 @@ mod tests {
         assert_eq!(summary.top_level_keys, vec!["messages", "model", "stream"]);
         assert_eq!(summary.body_bytes, 123);
         assert!(summary.stream);
+    }
+
+    #[test]
+    fn official_openai_chat_streams_request_usage_without_overriding_clients() {
+        let mut official = json!({"stream": true});
+        enable_stream_usage_if_supported(&mut official, WireApi::OpenAiChat, "openai");
+        assert_eq!(official["stream_options"]["include_usage"], true);
+
+        let mut disabled = json!({
+            "stream": true,
+            "stream_options": {"include_usage": false}
+        });
+        enable_stream_usage_if_supported(&mut disabled, WireApi::OpenAiChat, "openai");
+        assert_eq!(disabled["stream_options"]["include_usage"], false);
+
+        let mut compatible = json!({"stream": true});
+        enable_stream_usage_if_supported(&mut compatible, WireApi::OpenAiChat, "openai-compatible");
+        assert!(compatible.get("stream_options").is_none());
     }
 
     #[test]
@@ -2161,11 +2638,83 @@ mod tests {
         let body = serde_json::to_vec(&json!({
             "usageMetadata": {
                 "promptTokenCount": 11,
+                "cachedContentTokenCount": 6,
                 "candidatesTokenCount": 7
             }
         }))
         .unwrap();
 
-        assert_eq!(parse_usage(&body), (11, 7));
+        assert_eq!(
+            parse_usage(&body),
+            TokenUsage {
+                input_tokens: 11,
+                cached_input_tokens: 6,
+                output_tokens: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_usage_handles_uncached_and_invalid_payloads() {
+        let uncached = serde_json::to_vec(&json!({
+            "usage": {"input_tokens": 9, "output_tokens": 4}
+        }))
+        .unwrap();
+        assert_eq!(
+            parse_usage(&uncached),
+            TokenUsage {
+                input_tokens: 9,
+                cached_input_tokens: 0,
+                output_tokens: 4,
+            }
+        );
+        assert_eq!(parse_usage(b"not json"), TokenUsage::default());
+        assert_eq!(parse_usage(br#"{"id":"no-usage"}"#), TokenUsage::default());
+    }
+
+    #[test]
+    fn streaming_usage_merges_anthropic_events_across_chunks() {
+        let mut usage = StreamingUsage::default();
+        for chunk in [
+            &b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":17,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":3,\"output_tokens\":1}}}\n\n"[..],
+            &b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"out"[..],
+            &b"put_tokens\":9}}\n\n"[..],
+        ] {
+            usage.observe(chunk);
+        }
+
+        assert_eq!(
+            usage.tokens(),
+            TokenUsage {
+                input_tokens: 120,
+                cached_input_tokens: 100,
+                output_tokens: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_usage_reads_nested_responses_usage() {
+        let body = serde_json::to_vec(&json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 13,
+                    "input_tokens_details": {"cached_tokens": 10},
+                    "output_tokens": 8,
+                    "total_tokens": 21
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            parse_usage(&body),
+            TokenUsage {
+                input_tokens: 13,
+                cached_input_tokens: 10,
+                output_tokens: 8,
+            }
+        );
     }
 }

@@ -131,6 +131,7 @@ pub struct RequestLog {
     pub status_code: u16,
     pub latency_ms: u64,
     pub input_tokens: u64,
+    pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
     pub created_at: DateTime<Utc>,
@@ -142,6 +143,8 @@ pub struct RequestLog {
 pub struct UsageSummary {
     pub requests_today: u64,
     pub tokens_today: u64,
+    pub input_tokens_today: u64,
+    pub cached_input_tokens_today: u64,
     pub total_requests: u64,
     pub total_tokens: u64,
     pub estimated_cost_today: f64,

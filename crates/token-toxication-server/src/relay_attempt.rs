@@ -24,25 +24,34 @@ pub(crate) struct RelayAttemptLog {
     pub request_summary: Option<RequestSummary>,
 }
 
-pub(crate) struct RelayAttempt<'state> {
-    state: &'state AppState,
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TokenUsage {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+const CLIENT_CLOSED_REQUEST_STATUS: u16 = 499;
+
+pub(crate) struct RelayAttempt {
+    state: AppState,
     api_key_id: String,
     selection: ProviderRouteSelection,
     started: Instant,
 }
 
-pub(crate) struct AuthenticatedRelayAttempt<'state> {
-    state: &'state AppState,
+pub(crate) struct AuthenticatedRelayAttempt {
+    state: AppState,
     api_key_id: String,
     started: Instant,
 }
 
-impl<'state> RelayAttempt<'state> {
+impl RelayAttempt {
     pub(crate) async fn authenticate(
-        state: &'state AppState,
+        state: &AppState,
         headers: &HeaderMap,
         query: Option<&str>,
-    ) -> Result<AuthenticatedRelayAttempt<'state>, AppError> {
+    ) -> Result<AuthenticatedRelayAttempt, AppError> {
         let started = Instant::now();
         let api_key_id = authenticate_relay_api_key(state, headers, query)
             .await?
@@ -50,7 +59,7 @@ impl<'state> RelayAttempt<'state> {
             .id;
 
         Ok(AuthenticatedRelayAttempt {
-            state,
+            state: state.clone(),
             api_key_id,
             started,
         })
@@ -66,7 +75,7 @@ impl<'state> RelayAttempt<'state> {
         failure: RouteFailure,
     ) -> Result<(), AppError> {
         record_route_failure_state(
-            self.state,
+            &self.state,
             &self.selection.account.account.id,
             &self.selection.route_id,
             &failure,
@@ -77,8 +86,7 @@ impl<'state> RelayAttempt<'state> {
             failure
                 .status_code
                 .unwrap_or(StatusCode::BAD_GATEWAY.as_u16()),
-            0,
-            0,
+            TokenUsage::default(),
             Some(failure.error),
         )
         .await
@@ -112,11 +120,10 @@ impl<'state> RelayAttempt<'state> {
         status: StatusCode,
         headers: &HeaderMap,
         body: &[u8],
-        input_tokens: u64,
-        output_tokens: u64,
+        usage: TokenUsage,
     ) -> Result<(), AppError> {
         let error = record_upstream_response_result(
-            self.state,
+            &self.state,
             &self.selection.account.account.id,
             &self.selection.route_id,
             &self.selection.account.account.provider,
@@ -125,17 +132,30 @@ impl<'state> RelayAttempt<'state> {
             body,
         )
         .await?;
-        self.insert_request_log(log, status.as_u16(), input_tokens, output_tokens, error)
+        self.insert_request_log(log, status.as_u16(), usage, error)
             .await?;
         Ok(())
+    }
+
+    pub(crate) async fn record_client_disconnect(
+        &self,
+        log: &RelayAttemptLog,
+        usage: TokenUsage,
+    ) -> Result<(), AppError> {
+        self.insert_request_log(
+            log,
+            CLIENT_CLOSED_REQUEST_STATUS,
+            usage,
+            Some("client disconnected before the upstream stream completed".to_string()),
+        )
+        .await
     }
 
     async fn insert_request_log(
         &self,
         log: &RelayAttemptLog,
         status_code: u16,
-        input_tokens: u64,
-        output_tokens: u64,
+        usage: TokenUsage,
         error: Option<String>,
     ) -> Result<(), AppError> {
         self.state
@@ -152,8 +172,9 @@ impl<'state> RelayAttempt<'state> {
                 request_summary: log.request_summary.clone(),
                 status_code,
                 latency_ms: self.started.elapsed().as_millis() as u64,
-                input_tokens,
-                output_tokens,
+                input_tokens: usage.input_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                output_tokens: usage.output_tokens,
                 cost_usd: 0.0,
                 created_at: Utc::now(),
                 error,
@@ -163,12 +184,12 @@ impl<'state> RelayAttempt<'state> {
     }
 }
 
-impl<'state> AuthenticatedRelayAttempt<'state> {
+impl AuthenticatedRelayAttempt {
     pub(crate) async fn select(
         self,
         wire_api: &str,
         model: &str,
-    ) -> Result<RelayAttempt<'state>, AppError> {
+    ) -> Result<RelayAttempt, AppError> {
         let selection = self
             .state
             .db

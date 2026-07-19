@@ -101,6 +101,7 @@ impl Db {
                 status_code INTEGER NOT NULL,
                 latency_ms INTEGER NOT NULL,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 cost_usd REAL NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
@@ -154,6 +155,12 @@ impl Db {
         ensure_column(&conn, "request_logs", "upstream_model", "TEXT")?;
         ensure_column(&conn, "request_logs", "upstream_url", "TEXT")?;
         ensure_column(&conn, "request_logs", "request_summary", "TEXT")?;
+        ensure_column(
+            &conn,
+            "request_logs",
+            "cached_input_tokens",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         ensure_column(
             &conn,
             "provider_model_routes",
@@ -992,9 +999,9 @@ impl Db {
         conn.execute(
             "INSERT INTO request_logs
              (id, api_key_id, provider_account_id, method, path, model, upstream_model,
-              upstream_url, request_summary, status_code, latency_ms, input_tokens, output_tokens,
-              cost_usd, created_at, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              upstream_url, request_summary, status_code, latency_ms, input_tokens,
+              cached_input_tokens, output_tokens, cost_usd, created_at, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 log.id,
                 log.api_key_id,
@@ -1012,6 +1019,7 @@ impl Db {
                 log.status_code,
                 log.latency_ms,
                 log.input_tokens,
+                log.cached_input_tokens,
                 log.output_tokens,
                 log.cost_usd,
                 log.created_at.to_rfc3339(),
@@ -1026,7 +1034,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, api_key_id, provider_account_id, method, path, model, upstream_model,
                     upstream_url, request_summary, status_code, latency_ms, input_tokens,
-                    output_tokens, cost_usd, created_at, error
+                    cached_input_tokens, output_tokens, cost_usd, created_at, error
              FROM request_logs
              ORDER BY created_at DESC
              LIMIT ?1",
@@ -1233,10 +1241,11 @@ fn request_log_from_row(row: &rusqlite::Row<'_>) -> Result<RequestLog, rusqlite:
         status_code: row.get::<_, i64>(9)? as u16,
         latency_ms: row.get::<_, i64>(10)? as u64,
         input_tokens: row.get::<_, i64>(11)? as u64,
-        output_tokens: row.get::<_, i64>(12)? as u64,
-        cost_usd: row.get(13)?,
-        created_at: parse_time(row.get::<_, String>(14)?.as_str()),
-        error: row.get(15)?,
+        cached_input_tokens: row.get::<_, i64>(12)? as u64,
+        output_tokens: row.get::<_, i64>(13)? as u64,
+        cost_usd: row.get(14)?,
+        created_at: parse_time(row.get::<_, String>(15)?.as_str()),
+        error: row.get(16)?,
     })
 }
 
@@ -1247,8 +1256,18 @@ fn count(conn: &Connection, sql: &str) -> Result<u64, rusqlite::Error> {
 
 fn usage_summary(conn: &Connection, today: NaiveDate) -> Result<UsageSummary, rusqlite::Error> {
     let prefix = today.to_string();
-    let (requests_today, tokens_today, estimated_cost_today) = conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(input_tokens + output_tokens), 0), COALESCE(SUM(cost_usd), 0)
+    let (
+        requests_today,
+        tokens_today,
+        input_tokens_today,
+        cached_input_tokens_today,
+        estimated_cost_today,
+    ) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(input_tokens + output_tokens), 0),
+                COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(cached_input_tokens), 0),
+                COALESCE(SUM(cost_usd), 0)
          FROM request_logs
          WHERE created_at LIKE ?1 || '%'",
         params![prefix],
@@ -1256,7 +1275,9 @@ fn usage_summary(conn: &Connection, today: NaiveDate) -> Result<UsageSummary, ru
             Ok((
                 row.get::<_, i64>(0)? as u64,
                 row.get::<_, i64>(1)? as u64,
-                row.get::<_, f64>(2)?,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+                row.get::<_, f64>(4)?,
             ))
         },
     )?;
@@ -1269,6 +1290,8 @@ fn usage_summary(conn: &Connection, today: NaiveDate) -> Result<UsageSummary, ru
     Ok(UsageSummary {
         requests_today,
         tokens_today,
+        input_tokens_today,
+        cached_input_tokens_today,
         total_requests,
         total_tokens,
         estimated_cost_today,
@@ -1444,6 +1467,122 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn usage_summary_tracks_cached_input_tokens_today() {
+        let path =
+            std::env::temp_dir().join(format!("token-toxication-{}.sqlite3", Uuid::new_v4()));
+        let db = Db::open(&path).await.expect("open test database");
+
+        {
+            let conn = db.conn.lock().await;
+            let empty = usage_summary(
+                &conn,
+                NaiveDate::from_ymd_opt(2026, 7, 19).expect("valid date"),
+            )
+            .expect("build empty usage summary");
+            assert_eq!(empty.requests_today, 0);
+            assert_eq!(empty.tokens_today, 0);
+            assert_eq!(empty.input_tokens_today, 0);
+            assert_eq!(empty.cached_input_tokens_today, 0);
+        }
+
+        for (id, timestamp, input_tokens, cached_input_tokens, output_tokens) in [
+            ("today", "2026-07-19T04:00:00Z", 100, 60, 20),
+            ("yesterday", "2026-07-18T04:00:00Z", 40, 40, 10),
+        ] {
+            db.insert_request_log(RequestLog {
+                id: id.to_string(),
+                api_key_id: "test-key".to_string(),
+                provider_account_id: None,
+                method: "POST".to_string(),
+                path: "/openai/v1/responses".to_string(),
+                model: Some("test-model".to_string()),
+                upstream_model: None,
+                upstream_url: None,
+                request_summary: None,
+                status_code: 200,
+                latency_ms: 10,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                cost_usd: 0.0,
+                created_at: DateTime::parse_from_rfc3339(timestamp)
+                    .expect("parse request timestamp")
+                    .with_timezone(&Utc),
+                error: None,
+            })
+            .await
+            .expect("insert request log");
+        }
+
+        let conn = db.conn.lock().await;
+        let summary = usage_summary(
+            &conn,
+            NaiveDate::from_ymd_opt(2026, 7, 19).expect("valid date"),
+        )
+        .expect("build usage summary");
+        drop(conn);
+
+        assert_eq!(summary.requests_today, 1);
+        assert_eq!(summary.tokens_today, 120);
+        assert_eq!(summary.input_tokens_today, 100);
+        assert_eq!(summary.cached_input_tokens_today, 60);
+        assert_eq!(summary.total_requests, 2);
+        assert_eq!(summary.total_tokens, 170);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn startup_adds_cached_tokens_to_legacy_request_logs() {
+        let path =
+            std::env::temp_dir().join(format!("token-toxication-{}.sqlite3", Uuid::new_v4()));
+        let conn = Connection::open(&path).expect("open legacy database");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE request_logs (
+                id TEXT PRIMARY KEY,
+                api_key_id TEXT NOT NULL,
+                provider_account_id TEXT,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                model TEXT,
+                upstream_model TEXT,
+                upstream_url TEXT,
+                request_summary TEXT,
+                status_code INTEGER NOT NULL,
+                latency_ms INTEGER NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                error TEXT
+            );
+            INSERT INTO request_logs (
+                id, api_key_id, method, path, status_code, latency_ms,
+                input_tokens, output_tokens, created_at
+            ) VALUES (
+                'legacy-request', 'legacy-key', 'POST', '/openai/v1/responses',
+                200, 10, 12, 4, '2026-07-19T04:00:00+00:00'
+            );
+            "#,
+        )
+        .expect("seed legacy request log");
+        drop(conn);
+
+        let db = Db::open(&path).await.expect("migrate legacy database");
+        let logs = db.list_request_logs(1).await.expect("read migrated log");
+
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].input_tokens, 12);
+        assert_eq!(logs[0].cached_input_tokens, 0);
+        assert_eq!(logs[0].output_tokens, 4);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn request_trend_counts_real_five_minute_intervals() {
         let path =
             std::env::temp_dir().join(format!("token-toxication-{}.sqlite3", Uuid::new_v4()));
@@ -1478,6 +1617,7 @@ mod tests {
                 status_code: 200,
                 latency_ms: 10,
                 input_tokens: 1,
+                cached_input_tokens: 0,
                 output_tokens: 1,
                 cost_usd: 0.0,
                 created_at: DateTime::parse_from_rfc3339(timestamp)
