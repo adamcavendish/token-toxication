@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use aioduct::{
     RequestBuilderSend,
     runtime::{ConnectorSend, RuntimePoll},
@@ -17,7 +15,6 @@ use chrono::Utc;
 use futures_util::stream;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 use crate::{
     AppState,
@@ -25,7 +22,7 @@ use crate::{
         apply_antigravity_headers, begin_antigravity_oauth, complete_antigravity_oauth,
         gemini_account_models, gemini_account_quota,
     },
-    auth::{extract_api_key, generate_secret, login, logout, me, require_admin},
+    auth::{generate_secret, login, logout, me, require_admin},
     codex_subscription::{
         CodexSubscriptionAuthorization, codex_account_quota, codex_subscription_authorization,
         is_codex_subscription_auth,
@@ -37,7 +34,7 @@ use crate::{
     },
     models::{
         AnthropicModel, AnthropicModelListResponse, AntigravityOAuthStartRequest,
-        AntigravityOAuthStartResponse, ApiKeyListResponse, ApiKeyRecord, ApiKeyResponse,
+        AntigravityOAuthStartResponse, ApiKeyListResponse, ApiKeyResponse,
         CodexAccountQuotaResponse, CreateApiKeyRequest, CreateApiKeyResponse,
         CreateModelCatalogEntryRequest, CreateProviderAccountRequest,
         CreateProviderModelRouteRequest, Dashboard, GeminiAccountModelsResponse,
@@ -45,12 +42,13 @@ use crate::{
         MetricsResponse, ModelCatalogEntryResponse, ModelCatalogListResponse, OpenAiModel,
         OpenAiModelListResponse, ProviderAccountListResponse, ProviderAccountResponse,
         ProviderModelRouteListResponse, ProviderModelRouteResponse, ProviderPresetListResponse,
-        RequestLog, RequestLogListResponse, RequestSummary, UpdateApiKeyRequest,
+        RequestLogListResponse, RequestSummary, UpdateApiKeyRequest,
         UpdateModelCatalogEntryRequest, UpdateProviderAccountRequest,
         UpdateProviderModelRouteRequest,
     },
     provider_catalog::provider_presets,
-    routing::{RouteFailure, classify_response_failure, classify_transport_failure},
+    relay_attempt::{RelayAttempt, RelayAttemptLog, authenticate_relay_api_key},
+    routing::{RouteFailure, classify_transport_failure},
 };
 
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -327,41 +325,36 @@ async fn relay_json_endpoint(
     body: Bytes,
     wire_api: WireApi,
 ) -> Result<Response, AppError> {
-    let started = Instant::now();
-    let api_key = authenticate_relay_api_key(&state, &headers, uri.query()).await?;
-
+    let authenticated_attempt = RelayAttempt::authenticate(&state, &headers, uri.query()).await?;
     let mut request_json: Value = serde_json::from_slice(&body)
         .map_err(|error| AppError::BadRequest(format!("invalid JSON body: {error}")))?;
     wire_api.validate(&request_json)?;
     let model = request_json
         .get("model")
         .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    if model.is_none() {
-        return Err(AppError::BadRequest("request model is required".into()));
-    }
-    let api_key_id = api_key.view.id;
-
-    let selection = state
-        .db
-        .select_provider_account_for_wire(wire_api.account_value(), model.as_deref())
-        .await?
-        .ok_or_else(|| AppError::Forbidden("no active provider account is available".into()))?;
-    let route_id = selection.route_id.clone();
-    let public_model_id = selection.public_model_id.clone();
-    let upstream_model_id = selection.upstream_model_id.clone();
+        .ok_or_else(|| AppError::BadRequest("request model is required".into()))?;
+    let attempt = authenticated_attempt
+        .select(wire_api.account_value(), model)
+        .await?;
+    let upstream_model_id = attempt.selection().upstream_model_id.clone();
+    let strip_params = attempt.selection().strip_params.clone();
+    let account = attempt.selection().account.clone();
     request_json["model"] = Value::String(upstream_model_id.clone());
     let stripped_params = strip_upstream_params(
         &mut request_json,
-        &selection.strip_params,
+        &strip_params,
         wire_api,
-        &selection.account.account.auth_mode,
+        &account.account.auth_mode,
     );
     let body = serde_json::to_vec(&request_json)
         .map_err(|error| AppError::Internal(format!("serialize upstream request: {error}")))?;
     let request_summary = build_request_summary(&request_json, body.len() as u64, stripped_params);
-    let account = selection.account;
     let base_upstream_url = upstream_url(&account.account.base_url, wire_api.upstream_path());
+    let mut log = RelayAttemptLog {
+        path: wire_api.public_path().to_string(),
+        upstream_url: Some(base_upstream_url.clone()),
+        request_summary: Some(request_summary.clone()),
+    };
     let codex_auth = if is_codex_subscription_auth(&account.account.auth_mode) {
         if wire_api != WireApi::OpenAiResponses {
             return Err(AppError::BadRequest(
@@ -384,22 +377,7 @@ async fn relay_json_endpoint(
                 } else {
                     classify_transport_failure(error.to_string(), Utc::now())
                 };
-                record_upstream_failure(
-                    &state,
-                    UpstreamFailureLog {
-                        account_id: &account.account.id,
-                        route_id: &route_id,
-                        api_key_id: api_key_id.clone(),
-                        path: wire_api.public_path().to_string(),
-                        model: Some(public_model_id.clone()),
-                        upstream_model: Some(upstream_model_id.clone()),
-                        started,
-                        upstream_url: Some(sanitize_upstream_url(&base_upstream_url)),
-                        request_summary: Some(request_summary.clone()),
-                    },
-                    failure,
-                )
-                .await?;
+                attempt.record_failure(&log, failure).await?;
                 return Err(error);
             }
         }
@@ -411,7 +389,7 @@ async fn relay_json_endpoint(
         .as_ref()
         .map(|auth| auth.endpoint.clone())
         .unwrap_or(base_upstream_url);
-    let sanitized_upstream_url = Some(sanitize_upstream_url(&upstream_url));
+    log.upstream_url = Some(upstream_url.clone());
     let request = match state.http.post(&upstream_url) {
         Ok(request) => request
             .header(
@@ -420,22 +398,12 @@ async fn relay_json_endpoint(
             )
             .body(body),
         Err(error) => {
-            record_upstream_failure(
-                &state,
-                UpstreamFailureLog {
-                    account_id: &account.account.id,
-                    route_id: &route_id,
-                    api_key_id: api_key_id.clone(),
-                    path: wire_api.public_path().to_string(),
-                    model: Some(public_model_id.clone()),
-                    upstream_model: Some(upstream_model_id.clone()),
-                    started,
-                    upstream_url: sanitized_upstream_url.clone(),
-                    request_summary: Some(request_summary.clone()),
-                },
-                classify_transport_failure(error.to_string(), Utc::now()),
-            )
-            .await?;
+            attempt
+                .record_failure(
+                    &log,
+                    classify_transport_failure(error.to_string(), Utc::now()),
+                )
+                .await?;
             return Err(AppError::Upstream(error));
         }
     };
@@ -447,156 +415,65 @@ async fn relay_json_endpoint(
     let request = match request {
         Ok(request) => request,
         Err(error) => {
-            let failure = classify_transport_failure(error.to_string(), Utc::now());
-            record_upstream_failure(
-                &state,
-                UpstreamFailureLog {
-                    account_id: &account.account.id,
-                    route_id: &route_id,
-                    api_key_id: api_key_id.clone(),
-                    path: wire_api.public_path().to_string(),
-                    model: Some(public_model_id.clone()),
-                    upstream_model: Some(upstream_model_id.clone()),
-                    started,
-                    upstream_url: sanitized_upstream_url.clone(),
-                    request_summary: Some(request_summary.clone()),
-                },
-                failure,
-            )
-            .await?;
+            attempt
+                .record_failure(
+                    &log,
+                    classify_transport_failure(error.to_string(), Utc::now()),
+                )
+                .await?;
             return Err(error);
         }
     };
 
-    let upstream = request.send().await;
-    match upstream {
-        Ok(response) => {
-            let status = response.status();
-            let response_headers = response.headers().clone();
-            let content_type = response
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .cloned()
-                .unwrap_or_else(|| HeaderValue::from_static("application/json"));
-            let is_stream = request_json
-                .get("stream")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+    let response = attempt.send(request, &log).await?;
+    let status = response.status();
+    let response_headers = response.headers().clone();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+    let is_stream = request_json
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
-            if is_stream {
-                let error = record_upstream_response_result(
-                    &state,
-                    &account.account.id,
-                    &route_id,
-                    &account.account.provider,
-                    status,
-                    &response_headers,
-                    b"",
-                )
-                .await?;
-                state
-                    .db
-                    .insert_request_log(RequestLog {
-                        id: Uuid::new_v4().to_string(),
-                        api_key_id: api_key_id.clone(),
-                        provider_account_id: Some(account.account.id.clone()),
-                        method: "POST".to_string(),
-                        path: wire_api.public_path().to_string(),
-                        model: Some(public_model_id.clone()),
-                        upstream_model: Some(upstream_model_id.clone()),
-                        upstream_url: sanitized_upstream_url.clone(),
-                        request_summary: Some(request_summary.clone()),
-                        status_code: status.as_u16(),
-                        latency_ms: started.elapsed().as_millis() as u64,
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cost_usd: 0.0,
-                        created_at: Utc::now(),
-                        error,
-                    })
-                    .await?;
-                let body_stream =
-                    stream::unfold(response.into_bytes_stream(), |mut body| async move {
-                        body.next().await.map(|chunk| {
-                            let chunk = chunk.map_err(std::io::Error::other);
-                            (chunk, body)
-                        })
-                    });
-                let body = Body::from_stream(body_stream);
-                let mut relay = Response::builder()
-                    .status(status)
-                    .header(header::CONTENT_TYPE, content_type)
-                    .body(body)
-                    .map_err(|error| AppError::Internal(error.to_string()))?;
-                relay.headers_mut().insert(
-                    header::CACHE_CONTROL,
-                    HeaderValue::from_static("no-cache, no-transform"),
-                );
-                Ok(relay)
-            } else {
-                let bytes = response.bytes().await?;
-                let usage = parse_usage(&bytes);
-                let error = record_upstream_response_result(
-                    &state,
-                    &account.account.id,
-                    &route_id,
-                    &account.account.provider,
-                    status,
-                    &response_headers,
-                    &bytes,
-                )
-                .await?;
-                state
-                    .db
-                    .insert_request_log(RequestLog {
-                        id: Uuid::new_v4().to_string(),
-                        api_key_id: api_key_id.clone(),
-                        provider_account_id: Some(account.account.id.clone()),
-                        method: "POST".to_string(),
-                        path: wire_api.public_path().to_string(),
-                        model: Some(public_model_id.clone()),
-                        upstream_model: Some(upstream_model_id.clone()),
-                        upstream_url: sanitized_upstream_url.clone(),
-                        request_summary: Some(request_summary.clone()),
-                        status_code: status.as_u16(),
-                        latency_ms: started.elapsed().as_millis() as u64,
-                        input_tokens: usage.0,
-                        output_tokens: usage.1,
-                        cost_usd: 0.0,
-                        created_at: Utc::now(),
-                        error,
-                    })
-                    .await?;
-                let mut relay = Response::builder()
-                    .status(status)
-                    .header(header::CONTENT_TYPE, content_type)
-                    .body(Body::from(bytes))
-                    .map_err(|error| AppError::Internal(error.to_string()))?;
-                relay
-                    .headers_mut()
-                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-                Ok(relay)
-            }
-        }
-        Err(error) => {
-            record_upstream_failure(
-                &state,
-                UpstreamFailureLog {
-                    account_id: &account.account.id,
-                    route_id: &route_id,
-                    api_key_id,
-                    path: wire_api.public_path().to_string(),
-                    model: Some(public_model_id),
-                    upstream_model: Some(upstream_model_id),
-                    started,
-                    upstream_url: sanitized_upstream_url,
-                    request_summary: Some(request_summary),
-                },
-                classify_transport_failure(error.to_string(), Utc::now()),
-            )
+    if is_stream {
+        attempt
+            .record_response(&log, status, &response_headers, b"", 0, 0)
             .await?;
-            Err(AppError::Upstream(error.into()))
-        }
+        let body_stream = stream::unfold(response.into_bytes_stream(), |mut body| async move {
+            body.next().await.map(|chunk| {
+                let chunk = chunk.map_err(std::io::Error::other);
+                (chunk, body)
+            })
+        });
+        let body = Body::from_stream(body_stream);
+        let mut relay = Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(body)
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        relay.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, no-transform"),
+        );
+        Ok(relay)
+    } else {
+        let bytes = response.bytes().await?;
+        let usage = parse_usage(&bytes);
+        attempt
+            .record_response(&log, status, &response_headers, &bytes, usage.0, usage.1)
+            .await?;
+        let mut relay = Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(bytes))
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        relay
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        Ok(relay)
     }
 }
 
@@ -608,28 +485,18 @@ async fn relay_gemini_endpoint(
     model: String,
     method: GeminiMethod,
 ) -> Result<Response, AppError> {
-    let started = Instant::now();
-    let api_key = authenticate_relay_api_key(&state, &headers, uri.query()).await?;
-
+    let authenticated_attempt = RelayAttempt::authenticate(&state, &headers, uri.query()).await?;
     let mut request_json: Value = serde_json::from_slice(&body)
         .map_err(|error| AppError::BadRequest(format!("invalid JSON body: {error}")))?;
     validate_gemini_generate_content_request(&request_json)?;
-    let api_key_id = api_key.view.id;
-
-    let selection = state
-        .db
-        .select_provider_account_for_wire(
-            WireApi::GeminiGenerateContent.account_value(),
-            Some(model.as_str()),
-        )
-        .await?
-        .ok_or_else(|| AppError::Forbidden("no active provider account is available".into()))?;
-    let route_id = selection.route_id.clone();
-    let public_model_id = selection.public_model_id.clone();
-    let upstream_model_id = selection.upstream_model_id.clone();
-    let public_path = gemini_public_path(&public_model_id, method);
-    let stripped_params = strip_top_level_params(&mut request_json, &selection.strip_params);
-    let account = selection.account;
+    let attempt = authenticated_attempt
+        .select(WireApi::GeminiGenerateContent.account_value(), &model)
+        .await?;
+    let upstream_model_id = attempt.selection().upstream_model_id.clone();
+    let public_path = gemini_public_path(&attempt.selection().public_model_id, method);
+    let strip_params = attempt.selection().strip_params.clone();
+    let account = attempt.selection().account.clone();
+    let stripped_params = strip_top_level_params(&mut request_json, &strip_params);
     if !is_antigravity_oauth_auth(&account.account.auth_mode) {
         return Err(AppError::BadRequest(
             "Gemini native providers require Antigravity OAuth credentials".into(),
@@ -640,6 +507,11 @@ async fn relay_gemini_endpoint(
         method,
         uri.query(),
     );
+    let mut log = RelayAttemptLog {
+        path: public_path,
+        upstream_url: Some(fallback_upstream_url),
+        request_summary: None,
+    };
 
     let authorization =
         match gemini_code_assist_authorization(&state.db, &state.gemini_http, &account).await {
@@ -658,22 +530,7 @@ async fn relay_gemini_endpoint(
                 } else {
                     classify_transport_failure(error.to_string(), Utc::now())
                 };
-                record_upstream_failure(
-                    &state,
-                    UpstreamFailureLog {
-                        account_id: &account.account.id,
-                        route_id: &route_id,
-                        api_key_id: api_key_id.clone(),
-                        path: public_path.clone(),
-                        model: Some(public_model_id.clone()),
-                        upstream_model: Some(upstream_model_id.clone()),
-                        started,
-                        upstream_url: Some(sanitize_upstream_url(&fallback_upstream_url)),
-                        request_summary: None,
-                    },
-                    failure,
-                )
-                .await?;
+                attempt.record_failure(&log, failure).await?;
                 return Err(error);
             }
         };
@@ -695,7 +552,8 @@ async fn relay_gemini_endpoint(
     request_summary.stream = method.is_stream();
     let upstream_url =
         gemini_code_assist_upstream_url(&authorization.endpoint, method, uri.query());
-    let sanitized_upstream_url = Some(sanitize_upstream_url(&upstream_url));
+    log.upstream_url = Some(upstream_url.clone());
+    log.request_summary = Some(request_summary.clone());
 
     let request = match state.gemini_http.post(&upstream_url) {
         Ok(request) => request
@@ -705,295 +563,112 @@ async fn relay_gemini_endpoint(
             )
             .body(body),
         Err(error) => {
-            record_upstream_failure(
-                &state,
-                UpstreamFailureLog {
-                    account_id: &account.account.id,
-                    route_id: &route_id,
-                    api_key_id: api_key_id.clone(),
-                    path: public_path.clone(),
-                    model: Some(public_model_id.clone()),
-                    upstream_model: Some(upstream_model_id.clone()),
-                    started,
-                    upstream_url: sanitized_upstream_url.clone(),
-                    request_summary: Some(request_summary.clone()),
-                },
-                classify_transport_failure(error.to_string(), Utc::now()),
-            )
-            .await?;
+            attempt
+                .record_failure(
+                    &log,
+                    classify_transport_failure(error.to_string(), Utc::now()),
+                )
+                .await?;
             return Err(AppError::Upstream(error));
         }
     };
     let request = request.bearer_auth(&authorization.access_token);
     let request = apply_antigravity_headers(request)?;
 
-    let upstream = request.send().await;
-    match upstream {
-        Ok(response) => {
-            let status = response.status();
-            let response_headers = response.headers().clone();
-            let content_type = response
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .cloned()
-                .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+    let response = attempt.send(request, &log).await?;
+    let status = response.status();
+    let response_headers = response.headers().clone();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("application/json"));
 
-            if method.is_stream() {
-                let error = record_upstream_response_result(
-                    &state,
-                    &account.account.id,
-                    &route_id,
-                    &account.account.provider,
-                    status,
-                    &response_headers,
-                    b"",
-                )
-                .await?;
-                state
-                    .db
-                    .insert_request_log(RequestLog {
-                        id: Uuid::new_v4().to_string(),
-                        api_key_id: api_key_id.clone(),
-                        provider_account_id: Some(account.account.id.clone()),
-                        method: "POST".to_string(),
-                        path: public_path.clone(),
-                        model: Some(public_model_id.clone()),
-                        upstream_model: Some(upstream_model_id.clone()),
-                        upstream_url: sanitized_upstream_url.clone(),
-                        request_summary: Some(request_summary.clone()),
-                        status_code: status.as_u16(),
-                        latency_ms: started.elapsed().as_millis() as u64,
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cost_usd: 0.0,
-                        created_at: Utc::now(),
-                        error,
-                    })
-                    .await?;
-                let body_stream = stream::unfold(
-                    (
-                        response.into_bytes_stream(),
-                        String::new(),
-                        status.is_success(),
-                    ),
-                    |(mut body, mut buffer, unwrap_events)| async move {
-                        loop {
-                            if unwrap_events && let Some((event, rest)) = take_sse_event(&buffer) {
-                                buffer = rest;
-                                let chunk = transform_code_assist_sse_event(&event);
-                                return Some((
-                                    Ok(Bytes::from(chunk)),
-                                    (body, buffer, unwrap_events),
-                                ));
-                            }
+    if method.is_stream() {
+        attempt
+            .record_response(&log, status, &response_headers, b"", 0, 0)
+            .await?;
+        let body_stream = stream::unfold(
+            (
+                response.into_bytes_stream(),
+                String::new(),
+                status.is_success(),
+            ),
+            |(mut body, mut buffer, unwrap_events)| async move {
+                loop {
+                    if unwrap_events && let Some((event, rest)) = take_sse_event(&buffer) {
+                        buffer = rest;
+                        let chunk = transform_code_assist_sse_event(&event);
+                        return Some((Ok(Bytes::from(chunk)), (body, buffer, unwrap_events)));
+                    }
 
-                            match body.next().await {
-                                Some(Ok(chunk)) if unwrap_events => {
-                                    buffer.push_str(&String::from_utf8_lossy(&chunk));
-                                }
-                                Some(Ok(chunk)) => {
-                                    return Some((Ok(chunk), (body, buffer, unwrap_events)));
-                                }
-                                Some(Err(error)) => {
-                                    return Some((
-                                        Err(std::io::Error::other(error)),
-                                        (body, buffer, unwrap_events),
-                                    ));
-                                }
-                                None if unwrap_events && !buffer.is_empty() => {
-                                    let chunk = transform_code_assist_sse_event(&buffer);
-                                    buffer.clear();
-                                    return Some((
-                                        Ok(Bytes::from(chunk)),
-                                        (body, buffer, unwrap_events),
-                                    ));
-                                }
-                                None => return None,
-                            }
+                    match body.next().await {
+                        Some(Ok(chunk)) if unwrap_events => {
+                            buffer.push_str(&String::from_utf8_lossy(&chunk));
                         }
-                    },
-                );
-                let body = Body::from_stream(body_stream);
-                let mut relay = Response::builder()
-                    .status(status)
-                    .header(header::CONTENT_TYPE, content_type)
-                    .body(body)
-                    .map_err(|error| AppError::Internal(error.to_string()))?;
-                relay.headers_mut().insert(
-                    header::CACHE_CONTROL,
-                    HeaderValue::from_static("no-cache, no-transform"),
-                );
-                Ok(relay)
-            } else {
-                let upstream_bytes = response.bytes().await?;
-                let relay_bytes = if status.is_success() {
-                    unwrap_code_assist_response_bytes(&upstream_bytes)?
-                } else {
-                    upstream_bytes.to_vec()
-                };
-                let usage = parse_usage(&relay_bytes);
-                let error = record_upstream_response_result(
-                    &state,
-                    &account.account.id,
-                    &route_id,
-                    &account.account.provider,
-                    status,
-                    &response_headers,
-                    if status.is_success() {
-                        &relay_bytes
-                    } else {
-                        &upstream_bytes
-                    },
-                )
-                .await?;
-                state
-                    .db
-                    .insert_request_log(RequestLog {
-                        id: Uuid::new_v4().to_string(),
-                        api_key_id: api_key_id.clone(),
-                        provider_account_id: Some(account.account.id.clone()),
-                        method: "POST".to_string(),
-                        path: public_path,
-                        model: Some(public_model_id.clone()),
-                        upstream_model: Some(upstream_model_id.clone()),
-                        upstream_url: sanitized_upstream_url.clone(),
-                        request_summary: Some(request_summary.clone()),
-                        status_code: status.as_u16(),
-                        latency_ms: started.elapsed().as_millis() as u64,
-                        input_tokens: usage.0,
-                        output_tokens: usage.1,
-                        cost_usd: 0.0,
-                        created_at: Utc::now(),
-                        error,
-                    })
-                    .await?;
-                let mut relay = Response::builder()
-                    .status(status)
-                    .header(header::CONTENT_TYPE, content_type)
-                    .body(Body::from(relay_bytes))
-                    .map_err(|error| AppError::Internal(error.to_string()))?;
-                relay
-                    .headers_mut()
-                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-                Ok(relay)
-            }
-        }
-        Err(error) => {
-            record_upstream_failure(
-                &state,
-                UpstreamFailureLog {
-                    account_id: &account.account.id,
-                    route_id: &route_id,
-                    api_key_id,
-                    path: public_path,
-                    model: Some(public_model_id),
-                    upstream_model: Some(upstream_model_id),
-                    started,
-                    upstream_url: sanitized_upstream_url,
-                    request_summary: Some(request_summary),
-                },
-                classify_transport_failure(error.to_string(), Utc::now()),
+                        Some(Ok(chunk)) => {
+                            return Some((Ok(chunk), (body, buffer, unwrap_events)));
+                        }
+                        Some(Err(error)) => {
+                            return Some((
+                                Err(std::io::Error::other(error)),
+                                (body, buffer, unwrap_events),
+                            ));
+                        }
+                        None if unwrap_events && !buffer.is_empty() => {
+                            let chunk = transform_code_assist_sse_event(&buffer);
+                            buffer.clear();
+                            return Some((Ok(Bytes::from(chunk)), (body, buffer, unwrap_events)));
+                        }
+                        None => return None,
+                    }
+                }
+            },
+        );
+        let body = Body::from_stream(body_stream);
+        let mut relay = Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(body)
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        relay.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, no-transform"),
+        );
+        Ok(relay)
+    } else {
+        let upstream_bytes = response.bytes().await?;
+        let relay_bytes = if status.is_success() {
+            unwrap_code_assist_response_bytes(&upstream_bytes)?
+        } else {
+            upstream_bytes.to_vec()
+        };
+        let usage = parse_usage(&relay_bytes);
+        let health_body = if status.is_success() {
+            relay_bytes.as_slice()
+        } else {
+            upstream_bytes.as_ref()
+        };
+        attempt
+            .record_response(
+                &log,
+                status,
+                &response_headers,
+                health_body,
+                usage.0,
+                usage.1,
             )
             .await?;
-            Err(AppError::Upstream(error.into()))
-        }
+        let mut relay = Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(relay_bytes))
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        relay
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        Ok(relay)
     }
-}
-
-struct UpstreamFailureLog<'a> {
-    account_id: &'a str,
-    route_id: &'a str,
-    api_key_id: String,
-    path: String,
-    model: Option<String>,
-    upstream_model: Option<String>,
-    started: Instant,
-    upstream_url: Option<String>,
-    request_summary: Option<RequestSummary>,
-}
-
-async fn record_upstream_failure(
-    state: &AppState,
-    context: UpstreamFailureLog<'_>,
-    failure: RouteFailure,
-) -> Result<(), AppError> {
-    record_route_failure_state(state, context.account_id, context.route_id, &failure).await?;
-    state
-        .db
-        .insert_request_log(RequestLog {
-            id: Uuid::new_v4().to_string(),
-            api_key_id: context.api_key_id,
-            provider_account_id: Some(context.account_id.to_string()),
-            method: "POST".to_string(),
-            path: context.path,
-            model: context.model,
-            upstream_model: context.upstream_model,
-            upstream_url: context.upstream_url,
-            request_summary: context.request_summary,
-            status_code: failure
-                .status_code
-                .unwrap_or(StatusCode::BAD_GATEWAY.as_u16()),
-            latency_ms: context.started.elapsed().as_millis() as u64,
-            input_tokens: 0,
-            output_tokens: 0,
-            cost_usd: 0.0,
-            created_at: Utc::now(),
-            error: Some(failure.error),
-        })
-        .await?;
-    Ok(())
-}
-
-async fn record_upstream_response_result(
-    state: &AppState,
-    account_id: &str,
-    route_id: &str,
-    provider: &str,
-    status: StatusCode,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> Result<Option<String>, AppError> {
-    if status.is_success() {
-        state
-            .db
-            .mark_provider_result(account_id, "healthy", None)
-            .await?;
-        state
-            .db
-            .mark_route_success(route_id, status.as_u16())
-            .await?;
-        return Ok(None);
-    }
-
-    let failure = classify_response_failure(provider, status, headers, body, Utc::now());
-    let error = failure.error.clone();
-    record_route_failure_state(state, account_id, route_id, &failure).await?;
-    Ok(Some(error))
-}
-
-async fn record_route_failure_state(
-    state: &AppState,
-    account_id: &str,
-    route_id: &str,
-    failure: &RouteFailure,
-) -> Result<(), AppError> {
-    if let Some(provider_status) = failure.provider_status {
-        state
-            .db
-            .mark_provider_result(account_id, provider_status, Some(&failure.error))
-            .await?;
-    }
-    state
-        .db
-        .mark_route_failure(
-            route_id,
-            failure.route_status,
-            failure.status_code,
-            &failure.error,
-            failure.cooldown_until,
-        )
-        .await?;
-    Ok(())
 }
 
 pub async fn admin_dashboard(State(state): State<AppState>) -> Result<Json<Dashboard>, AppError> {
@@ -1547,16 +1222,6 @@ fn transform_code_assist_sse_event(event: &str) -> String {
     transformed
 }
 
-fn sanitize_upstream_url(value: &str) -> String {
-    match value.parse::<Uri>() {
-        Ok(uri) => match (uri.scheme_str(), uri.authority()) {
-            (Some(scheme), Some(authority)) => format!("{scheme}://{}{}", authority, uri.path()),
-            _ => value.split('?').next().unwrap_or(value).to_string(),
-        },
-        Err(_) => value.split('?').next().unwrap_or(value).to_string(),
-    }
-}
-
 fn strip_top_level_params(value: &mut Value, strip_params: &[String]) -> Vec<String> {
     let Some(object) = value.as_object_mut() else {
         return Vec::new();
@@ -1656,23 +1321,6 @@ fn parse_usage(bytes: &[u8]) -> (u64, u64) {
     (input, output)
 }
 
-async fn authenticate_relay_api_key(
-    state: &AppState,
-    headers: &HeaderMap,
-    query: Option<&str>,
-) -> Result<ApiKeyRecord, AppError> {
-    let api_key = extract_api_key(headers, query)
-        .ok_or_else(|| AppError::Unauthorized("missing API key".into()))?;
-    if !api_key.starts_with(&state.config.api_key_prefix) {
-        return Err(AppError::Unauthorized("invalid API key prefix".into()));
-    }
-    state
-        .db
-        .validate_api_key(&api_key)
-        .await?
-        .ok_or_else(|| AppError::Unauthorized("invalid or inactive API key".into()))
-}
-
 async fn openai_models(state: &AppState) -> Result<Vec<OpenAiModel>, AppError> {
     let models = state
         .db
@@ -1770,8 +1418,600 @@ fn validate_provider_model_route_input(
 
 #[cfg(test)]
 mod tests {
+    use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+
     use super::*;
-    use serde_json::json;
+    use aioduct::TokioClient;
+    use axum::{
+        Json, Router,
+        body::{Bytes, to_bytes},
+        extract::State,
+        http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
+        routing::post,
+    };
+    use chrono::Utc;
+    use serde_json::{Value, json};
+    use tokio::{net::TcpListener, sync::Mutex};
+    use uuid::Uuid;
+
+    use crate::{
+        antigravity_oauth::AntigravityOAuthStore,
+        config::{Config, HttpsMode, LETS_ENCRYPT_PRODUCTION_DIRECTORY},
+        db::Db,
+        models::{
+            CreateApiKeyRequest, CreateModelCatalogEntryRequest, CreateProviderAccountRequest,
+            CreateProviderModelRouteRequest,
+        },
+    };
+
+    fn test_database_path() -> PathBuf {
+        std::env::temp_dir().join(format!("token-toxication-relay-{}.sqlite3", Uuid::new_v4()))
+    }
+
+    fn remove_test_database(path: &PathBuf) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+    }
+
+    fn test_http_client() -> TokioClient {
+        TokioClient::builder()
+            .tls(aioduct::tls::RustlsConnector::with_webpki_roots())
+            .user_agent("token-toxication-test")
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build test HTTP client")
+    }
+
+    fn test_state(db: Db, database_path: PathBuf) -> AppState {
+        AppState {
+            config: Arc::new(Config {
+                bind_addr: "127.0.0.1:3000".parse().expect("parse bind address"),
+                https_mode: HttpsMode::Off,
+                tls_cert_path: None,
+                tls_key_path: None,
+                acme_identifier: None,
+                acme_email: None,
+                acme_http_bind_addr: "127.0.0.1:3001".parse().expect("parse ACME bind address"),
+                acme_allow_nonstandard_http_port: false,
+                acme_cert_dir: PathBuf::from("data/acme"),
+                acme_directory_url: LETS_ENCRYPT_PRODUCTION_DIRECTORY.to_string(),
+                database_path,
+                static_dir: PathBuf::from("apps/admin/dist"),
+                admin_username: "admin".to_string(),
+                admin_password: "test-password".to_string(),
+                api_key_prefix: "tokentoxication-".to_string(),
+                allow_default_admin_password: false,
+            }),
+            db,
+            http: test_http_client(),
+            gemini_http: test_http_client(),
+            antigravity_oauth: AntigravityOAuthStore::default(),
+            started_at: Utc::now(),
+        }
+    }
+
+    struct RelayRouteSeed<'a> {
+        base_url: String,
+        provider: &'a str,
+        auth_mode: &'a str,
+        provider_secret: String,
+        wire_api: &'a str,
+        public_model: &'a str,
+        upstream_model: &'a str,
+    }
+
+    struct SeededRelayRoute {
+        relay_secret: String,
+        account_id: String,
+        route_id: String,
+    }
+
+    fn gemini_relay_route_seed(address: SocketAddr) -> RelayRouteSeed<'static> {
+        let base_url = format!("http://{address}");
+        let credential = json!({
+            "type": "token-toxication-antigravity-oauth-v1",
+            "refresh": "refresh-token",
+            "access": "access-token",
+            "expires": Utc::now().timestamp_millis() + 3_600_000,
+            "project": "test-project",
+            "endpoint": base_url,
+        })
+        .to_string();
+
+        RelayRouteSeed {
+            base_url: format!("http://{address}"),
+            provider: "gemini",
+            auth_mode: "antigravity-oauth",
+            provider_secret: credential,
+            wire_api: "gemini-generate-content",
+            public_model: "public-gemini-model",
+            upstream_model: "upstream-gemini-model",
+        }
+    }
+
+    async fn seed_relay_route(db: &Db, seed: RelayRouteSeed<'_>) -> SeededRelayRoute {
+        let RelayRouteSeed {
+            base_url,
+            provider,
+            auth_mode,
+            provider_secret,
+            wire_api,
+            public_model,
+            upstream_model,
+        } = seed;
+        let relay_secret = "tokentoxication-relay-test-key".to_string();
+        db.create_api_key(
+            CreateApiKeyRequest {
+                name: "relay test key".to_string(),
+                description: String::new(),
+                permissions: Vec::new(),
+                rate_limit_per_minute: 0,
+                concurrency_limit: 0,
+                daily_cost_limit: 0.0,
+                expires_at: None,
+            },
+            &relay_secret,
+        )
+        .await
+        .expect("create relay key");
+        let account = db
+            .create_provider_account(CreateProviderAccountRequest {
+                name: "test provider".to_string(),
+                provider: provider.to_string(),
+                base_url,
+                auth_mode: auth_mode.to_string(),
+                wire_api: wire_api.to_string(),
+                api_key: provider_secret,
+                is_active: true,
+                priority: 0,
+            })
+            .await
+            .expect("create provider account");
+        db.create_model_catalog_entry(CreateModelCatalogEntryRequest {
+            id: public_model.to_string(),
+            display_name: String::new(),
+            family: "test".to_string(),
+            enabled: true,
+        })
+        .await
+        .expect("create model catalog entry");
+        let route = db
+            .create_provider_model_route(CreateProviderModelRouteRequest {
+                public_model_id: public_model.to_string(),
+                provider_account_id: account.id.clone(),
+                upstream_model_id: upstream_model.to_string(),
+                wire_api: wire_api.to_string(),
+                role: "primary".to_string(),
+                enabled: true,
+                strip_params: Vec::new(),
+            })
+            .await
+            .expect("create provider route");
+        SeededRelayRoute {
+            relay_secret,
+            account_id: account.id,
+            route_id: route.id,
+        }
+    }
+
+    fn relay_headers(secret: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {secret}")).expect("relay key header"),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_requests_are_rejected_before_wire_validation() {
+        let database_path = test_database_path();
+        let db = Db::open(&database_path).await.expect("open test database");
+        let state = test_state(db, database_path.clone());
+
+        let error = relay_openai_chat(
+            State(state.clone()),
+            HeaderMap::new(),
+            Uri::from_static("/openai/v1/chat/completions"),
+            Bytes::from_static(b"not valid JSON"),
+        )
+        .await
+        .expect_err("missing relay credentials must win over an invalid request body");
+
+        assert_eq!(error.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(error.to_string(), "missing API key");
+
+        drop(state);
+        remove_test_database(&database_path);
+    }
+
+    #[tokio::test]
+    async fn openai_chat_relay_rewrites_the_model_and_records_the_attempt() {
+        let seen = Arc::new(Mutex::new(None));
+        let handler_seen = Arc::clone(&seen);
+        let upstream = Router::new().route(
+            "/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let handler_seen = Arc::clone(&handler_seen);
+                async move {
+                    *handler_seen.lock().await = Some((headers, body));
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "chat-1",
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 5}
+                        })),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let address = listener.local_addr().expect("upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("serve upstream");
+        });
+
+        let database_path = test_database_path();
+        let db = Db::open(&database_path).await.expect("open test database");
+        let SeededRelayRoute {
+            relay_secret,
+            account_id,
+            route_id,
+        } = seed_relay_route(
+            &db,
+            RelayRouteSeed {
+                base_url: format!("http://{address}"),
+                provider: "openai-compatible",
+                auth_mode: "bearer",
+                provider_secret: "provider-secret".to_string(),
+                wire_api: "openai-chat",
+                public_model: "public-chat-model",
+                upstream_model: "upstream-chat-model",
+            },
+        )
+        .await;
+        let state = test_state(db, database_path.clone());
+
+        let response = relay_openai_chat(
+            State(state.clone()),
+            relay_headers(&relay_secret),
+            Uri::from_static("/openai/v1/chat/completions"),
+            Bytes::from_static(
+                br#"{"model":"public-chat-model","messages":[{"role":"user","content":"hello"}]}"#,
+            ),
+        )
+        .await
+        .expect("relay response");
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let relay_body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read relay response"),
+        )
+        .expect("decode relay response");
+        assert_eq!(relay_body["id"], "chat-1");
+
+        let (headers, body) = seen.lock().await.take().expect("capture upstream request");
+        assert_eq!(body["model"], "upstream-chat-model");
+        assert_eq!(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer provider-secret")
+        );
+
+        let logs = state
+            .db
+            .list_request_logs(1)
+            .await
+            .expect("list request logs");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status_code, 200);
+        assert_eq!(logs[0].model.as_deref(), Some("public-chat-model"));
+        assert_eq!(
+            logs[0].upstream_model.as_deref(),
+            Some("upstream-chat-model")
+        );
+        assert_eq!((logs[0].input_tokens, logs[0].output_tokens), (3, 5));
+        assert!(logs[0].error.is_none());
+        assert_eq!(
+            state
+                .db
+                .get_provider_account(&account_id)
+                .await
+                .expect("get provider account")
+                .expect("provider account")
+                .status,
+            "healthy"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_provider_model_route(&route_id)
+                .await
+                .expect("get provider route")
+                .expect("provider route")
+                .last_status_code,
+            Some(200)
+        );
+
+        drop(state);
+        remove_test_database(&database_path);
+    }
+
+    #[tokio::test]
+    async fn upstream_rate_limit_marks_the_route_and_records_the_failure() {
+        let upstream = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"error": {"message": "quota exhausted"}})),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let address = listener.local_addr().expect("upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("serve upstream");
+        });
+
+        let database_path = test_database_path();
+        let db = Db::open(&database_path).await.expect("open test database");
+        let SeededRelayRoute {
+            relay_secret,
+            route_id,
+            ..
+        } = seed_relay_route(
+            &db,
+            RelayRouteSeed {
+                base_url: format!("http://{address}"),
+                provider: "openai-compatible",
+                auth_mode: "bearer",
+                provider_secret: "provider-secret".to_string(),
+                wire_api: "openai-chat",
+                public_model: "public-chat-model",
+                upstream_model: "upstream-chat-model",
+            },
+        )
+        .await;
+        let state = test_state(db, database_path.clone());
+
+        let response = relay_openai_chat(
+            State(state.clone()),
+            relay_headers(&relay_secret),
+            Uri::from_static("/openai/v1/chat/completions"),
+            Bytes::from_static(
+                br#"{"model":"public-chat-model","messages":[{"role":"user","content":"hello"}]}"#,
+            ),
+        )
+        .await
+        .expect("relay response");
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let logs = state
+            .db
+            .list_request_logs(1)
+            .await
+            .expect("list request logs");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status_code, 429);
+        assert_eq!(logs[0].error.as_deref(), Some("upstream returned 429"));
+        let route = state
+            .db
+            .get_provider_model_route(&route_id)
+            .await
+            .expect("get provider route")
+            .expect("provider route");
+        assert_eq!(route.status, "cooling_down");
+        assert_eq!(route.last_status_code, Some(429));
+        assert!(route.cooldown_until.is_some());
+
+        drop(state);
+        remove_test_database(&database_path);
+    }
+
+    #[tokio::test]
+    async fn gemini_relay_transforms_the_wire_payload_and_records_the_attempt() {
+        let seen = Arc::new(Mutex::new(None));
+        let handler_seen = Arc::clone(&seen);
+        let upstream = Router::new().route(
+            "/v1internal:generateContent",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let handler_seen = Arc::clone(&handler_seen);
+                async move {
+                    *handler_seen.lock().await = Some((headers, body));
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "traceId": "gemini-1",
+                            "response": {
+                                "candidates": [{"content": {"parts": [{"text": "hello"}]}}],
+                                "usageMetadata": {
+                                    "promptTokenCount": 11,
+                                    "candidatesTokenCount": 7
+                                }
+                            }
+                        })),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let address = listener.local_addr().expect("upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("serve upstream");
+        });
+
+        let database_path = test_database_path();
+        let db = Db::open(&database_path).await.expect("open test database");
+        let SeededRelayRoute {
+            relay_secret,
+            account_id,
+            route_id,
+        } = seed_relay_route(&db, gemini_relay_route_seed(address)).await;
+        let state = test_state(db, database_path.clone());
+
+        let response = relay_gemini_generate_content(
+            State(state.clone()),
+            relay_headers(&relay_secret),
+            Uri::from_static("/gemini/v1beta/models/public-gemini-model:generateContent"),
+            axum::extract::Path("public-gemini-model:generateContent".to_string()),
+            Bytes::from_static(br#"{"contents":[{"parts":[{"text":"hello"}]}]}"#),
+        )
+        .await
+        .expect("relay response");
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let relay_body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read relay response"),
+        )
+        .expect("decode relay response");
+        assert_eq!(relay_body["responseId"], "gemini-1");
+        assert_eq!(relay_body["usageMetadata"]["promptTokenCount"], 11);
+
+        let (headers, body) = seen.lock().await.take().expect("capture upstream request");
+        assert_eq!(body["model"], "upstream-gemini-model");
+        assert_eq!(body["project"], "test-project");
+        assert_eq!(body["request"]["contents"][0]["role"], "user");
+        assert_eq!(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer access-token")
+        );
+
+        let logs = state
+            .db
+            .list_request_logs(1)
+            .await
+            .expect("list request logs");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status_code, 200);
+        assert_eq!(logs[0].model.as_deref(), Some("public-gemini-model"));
+        assert_eq!(
+            logs[0].upstream_model.as_deref(),
+            Some("upstream-gemini-model")
+        );
+        assert_eq!((logs[0].input_tokens, logs[0].output_tokens), (11, 7));
+        assert!(logs[0].error.is_none());
+        assert_eq!(
+            state
+                .db
+                .get_provider_account(&account_id)
+                .await
+                .expect("get provider account")
+                .expect("provider account")
+                .status,
+            "healthy"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_provider_model_route(&route_id)
+                .await
+                .expect("get provider route")
+                .expect("provider route")
+                .last_status_code,
+            Some(200)
+        );
+
+        drop(state);
+        remove_test_database(&database_path);
+    }
+
+    #[tokio::test]
+    async fn gemini_relay_preserves_upstream_errors_and_cools_the_route() {
+        const UPSTREAM_ERROR: &str = r#"{"error":{"message":"provider unavailable"}}"#;
+
+        let upstream = Router::new().route(
+            "/v1internal:generateContent",
+            post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    UPSTREAM_ERROR,
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let address = listener.local_addr().expect("upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("serve upstream");
+        });
+
+        let database_path = test_database_path();
+        let db = Db::open(&database_path).await.expect("open test database");
+        let SeededRelayRoute {
+            relay_secret,
+            route_id,
+            ..
+        } = seed_relay_route(&db, gemini_relay_route_seed(address)).await;
+        let state = test_state(db, database_path.clone());
+
+        let response = relay_gemini_generate_content(
+            State(state.clone()),
+            relay_headers(&relay_secret),
+            Uri::from_static("/gemini/v1beta/models/public-gemini-model:generateContent"),
+            axum::extract::Path("public-gemini-model:generateContent".to_string()),
+            Bytes::from_static(br#"{"contents":[{"parts":[{"text":"hello"}]}]}"#),
+        )
+        .await
+        .expect("relay response");
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read relay response")
+                .as_ref(),
+            UPSTREAM_ERROR.as_bytes()
+        );
+        let logs = state
+            .db
+            .list_request_logs(1)
+            .await
+            .expect("list request logs");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status_code, 503);
+        assert_eq!(logs[0].error.as_deref(), Some("upstream returned 503"));
+        let route = state
+            .db
+            .get_provider_model_route(&route_id)
+            .await
+            .expect("get provider route")
+            .expect("provider route");
+        assert_eq!(route.status, "cooling_down");
+        assert_eq!(route.last_status_code, Some(503));
+        assert!(route.cooldown_until.is_some());
+
+        drop(state);
+        remove_test_database(&database_path);
+    }
 
     #[test]
     fn strip_params_remove_only_top_level_keys_and_summarize_metadata() {
@@ -1851,7 +2091,9 @@ mod tests {
     #[test]
     fn sanitize_upstream_url_removes_query() {
         assert_eq!(
-            sanitize_upstream_url("https://api.example.com/v1/messages?token=secret"),
+            crate::relay_attempt::sanitize_upstream_url(
+                "https://api.example.com/v1/messages?token=secret"
+            ),
             "https://api.example.com/v1/messages"
         );
     }
