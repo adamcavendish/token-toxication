@@ -156,9 +156,14 @@ Route health is tracked separately from provider account health. A 401 or 403
 blocks the provider account. A 429 cools only the selected route for 60 seconds
 by default; MiniMax `x-model-quota-remaining` values containing `=0` cool that
 selected route for one hour. A 5xx or network failure cools the selected route
-for 30 seconds. If the primary route is disabled, blocked, or still cooling
-down, the next request uses an eligible backup route. It does not retry another
-provider inside the same request.
+for 30 seconds. An OpenAI Responses stream that terminates with an `error` or
+`response.failed` event is recorded as a failed attempt even when the upstream
+began the stream with HTTP 200. A `server_error` records 502 and cools the route
+for 30 seconds; `rate_limit_exceeded` records 429 and cools it for 60 seconds.
+Unknown provider-specific codes record 502 without changing route health. If the
+primary route is disabled, blocked, or still cooling down, the next request uses
+an eligible backup route. It does not retry another provider inside the same
+request.
 
 For Codex with an OpenAI API key, add an OpenAI provider account with base URL
 `https://api.openai.com`, Bearer auth, and `openai-responses`. For Codex with
@@ -209,7 +214,8 @@ and output token counts. Streaming requests are finalized after the upstream
 stream ends so terminal usage events are captured. The admin overview reports
 today's cache hit rate as cached input tokens divided by input tokens, and each
 request row shows its own rate. Older rows and providers that do not report
-cached usage display 0%.
+cached usage display 0%. Failed streams that report no usage retain zero token
+counts; their request-log status and error identify the failed attempt.
 
 ## Configuration
 

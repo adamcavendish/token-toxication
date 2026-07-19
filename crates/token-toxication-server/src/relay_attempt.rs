@@ -74,6 +74,16 @@ impl RelayAttempt {
         log: &RelayAttemptLog,
         failure: RouteFailure,
     ) -> Result<(), AppError> {
+        self.record_failure_with_usage(log, failure, TokenUsage::default())
+            .await
+    }
+
+    pub(crate) async fn record_failure_with_usage(
+        &self,
+        log: &RelayAttemptLog,
+        failure: RouteFailure,
+        usage: TokenUsage,
+    ) -> Result<(), AppError> {
         record_route_failure_state(
             &self.state,
             &self.selection.account.account.id,
@@ -86,10 +96,21 @@ impl RelayAttempt {
             failure
                 .status_code
                 .unwrap_or(StatusCode::BAD_GATEWAY.as_u16()),
-            TokenUsage::default(),
+            usage,
             Some(failure.error),
         )
         .await
+    }
+
+    pub(crate) async fn record_application_failure(
+        &self,
+        log: &RelayAttemptLog,
+        status: StatusCode,
+        usage: TokenUsage,
+        error: String,
+    ) -> Result<(), AppError> {
+        self.insert_request_log(log, status.as_u16(), usage, Some(error))
+            .await
     }
 
     pub(crate) async fn send<'request, R, C>(

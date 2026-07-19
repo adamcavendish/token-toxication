@@ -52,7 +52,7 @@ use crate::{
     },
     provider_catalog::provider_presets,
     relay_attempt::{RelayAttempt, RelayAttemptLog, TokenUsage, authenticate_relay_api_key},
-    routing::{RouteFailure, classify_transport_failure},
+    routing::{RouteFailure, classify_transport_failure, classify_upstream_application_failure},
 };
 
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -450,8 +450,14 @@ async fn relay_json_endpoint(
                 (chunk, body)
             })
         });
-        let body_stream =
-            record_streaming_response(body_stream, attempt, log, status, response_headers);
+        let body_stream = record_streaming_response(
+            body_stream,
+            attempt,
+            log,
+            status,
+            response_headers,
+            wire_api,
+        );
         let body = Body::from_stream(body_stream);
         let mut relay = Response::builder()
             .status(status)
@@ -626,8 +632,14 @@ async fn relay_gemini_endpoint(
                 }
             },
         );
-        let body_stream =
-            record_streaming_response(body_stream, attempt, log, status, response_headers);
+        let body_stream = record_streaming_response(
+            body_stream,
+            attempt,
+            log,
+            status,
+            response_headers,
+            WireApi::GeminiGenerateContent,
+        );
         let body = Body::from_stream(body_stream);
         let mut relay = Response::builder()
             .status(status)
@@ -1317,6 +1329,7 @@ fn record_streaming_response<S>(
     log: RelayAttemptLog,
     status: StatusCode,
     response_headers: HeaderMap,
+    wire_api: WireApi,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
@@ -1328,7 +1341,7 @@ where
     let (sender, receiver) = mpsc::channel(BUFFERED_CHUNKS);
     tokio::spawn(async move {
         let mut body_stream = Box::pin(body_stream);
-        let mut usage = StreamingUsage::default();
+        let mut observation = StreamingResponseObservation::default();
         let stream_end = loop {
             let next = tokio::select! {
                 _ = sender.closed() => break StreamEnd::ClientDisconnected,
@@ -1336,7 +1349,7 @@ where
             };
             match next {
                 Some(Ok(chunk)) => {
-                    usage.observe(&chunk);
+                    observation.observe(&chunk);
                     if sender.send(Ok(chunk)).await.is_err() {
                         break StreamEnd::ClientDisconnected;
                     }
@@ -1345,6 +1358,37 @@ where
                 None => break StreamEnd::Complete,
             }
         };
+
+        if let Some(failure) = observation.application_failure(wire_api) {
+            let usage = observation.tokens();
+            let error = failure.log_error();
+            let route_failure = classify_upstream_application_failure(
+                failure.code.as_deref(),
+                error.clone(),
+                Utc::now(),
+            );
+            let result = match route_failure {
+                Some(route_failure) => {
+                    attempt
+                        .record_failure_with_usage(&log, route_failure, usage)
+                        .await
+                }
+                None => {
+                    attempt
+                        .record_application_failure(&log, StatusCode::BAD_GATEWAY, usage, error)
+                        .await
+                }
+            };
+            if let Err(record_error) = result {
+                tracing::error!(
+                    error = %record_error,
+                    path = %log.path,
+                    "failed to record upstream application stream failure"
+                );
+                let _ = sender.send(Err(io::Error::other(record_error))).await;
+            }
+            return;
+        }
 
         match stream_end {
             StreamEnd::UpstreamError(error) => {
@@ -1360,7 +1404,10 @@ where
                 return;
             }
             StreamEnd::ClientDisconnected => {
-                if let Err(error) = attempt.record_client_disconnect(&log, usage.tokens()).await {
+                if let Err(error) = attempt
+                    .record_client_disconnect(&log, observation.tokens())
+                    .await
+                {
                     tracing::error!(
                         %error,
                         path = %log.path,
@@ -1372,7 +1419,7 @@ where
             StreamEnd::Complete => {}
         }
 
-        let usage = usage.tokens();
+        let usage = observation.tokens();
         if let Err(error) = attempt
             .record_response(&log, status, &response_headers, b"", usage)
             .await
@@ -1440,13 +1487,14 @@ impl UsageUpdate {
 }
 
 #[derive(Debug)]
-struct StreamingUsage {
+struct StreamingResponseObservation {
     decoder: SseDecoder,
     buffer: BytesMut,
     usage: UsageUpdate,
+    application_failure: Option<StreamingApplicationFailure>,
 }
 
-impl Default for StreamingUsage {
+impl Default for StreamingResponseObservation {
     fn default() -> Self {
         Self {
             // Responses completion events can contain the full generated
@@ -1454,11 +1502,12 @@ impl Default for StreamingUsage {
             decoder: SseDecoder::with_max_payload_size(0),
             buffer: BytesMut::new(),
             usage: UsageUpdate::default(),
+            application_failure: None,
         }
     }
 }
 
-impl StreamingUsage {
+impl StreamingResponseObservation {
     fn observe(&mut self, chunk: &[u8]) {
         self.buffer.extend_from_slice(chunk);
         while let Some(event) = self.decoder.decode(&mut self.buffer) {
@@ -1469,12 +1518,61 @@ impl StreamingUsage {
                 continue;
             };
             self.usage.merge(usage_update(&value));
+            if let Some(error) = openai_responses_stream_failure(&value) {
+                self.application_failure = Some(error);
+            }
         }
     }
 
     fn tokens(&self) -> TokenUsage {
         self.usage.tokens()
     }
+
+    fn application_failure(&self, wire_api: WireApi) -> Option<&StreamingApplicationFailure> {
+        if wire_api == WireApi::OpenAiResponses {
+            self.application_failure.as_ref()
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamingApplicationFailure {
+    code: Option<String>,
+}
+
+impl StreamingApplicationFailure {
+    fn log_error(&self) -> String {
+        self.code.as_ref().map_or_else(
+            || "upstream stream failed".to_string(),
+            |code| format!("upstream stream failed ({code})"),
+        )
+    }
+}
+
+fn openai_responses_stream_failure(value: &Value) -> Option<StreamingApplicationFailure> {
+    let error = match value.get("type").and_then(Value::as_str)? {
+        "error" => value,
+        "response.failed" => value.pointer("/response/error").unwrap_or(value),
+        _ => return None,
+    };
+
+    Some(StreamingApplicationFailure {
+        code: normalized_stream_error_code(error),
+    })
+}
+
+fn normalized_stream_error_code(error: &Value) -> Option<String> {
+    const MAX_ERROR_CODE_BYTES: usize = 64;
+
+    let code = error.get("code")?.as_str()?.trim();
+    (!code.is_empty()
+        && code.len() <= MAX_ERROR_CODE_BYTES
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    .then(|| code.to_string())
 }
 
 fn parse_usage(bytes: &[u8]) -> TokenUsage {
@@ -2035,6 +2133,211 @@ mod tests {
         assert_eq!(logs.len(), 1);
         assert_eq!((logs[0].input_tokens, logs[0].output_tokens), (13, 8));
         assert_eq!(logs[0].cached_input_tokens, 10);
+
+        drop(state);
+        remove_test_database(&database_path);
+    }
+
+    #[tokio::test]
+    async fn streamed_openai_responses_record_application_failure() {
+        const STREAM: &str = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"temporary upstream failure\",\"sequence_number\":3}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"temporary upstream failure\"},\"usage\":{\"input_tokens\":13,\"input_tokens_details\":{\"cached_tokens\":10},\"output_tokens\":8,\"total_tokens\":21}},\"sequence_number\":4}\n\n"
+        );
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(STREAM))
+                    .expect("build upstream response")
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let address = listener.local_addr().expect("upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("serve upstream");
+        });
+
+        let database_path = test_database_path();
+        let db = Db::open(&database_path).await.expect("open test database");
+        let SeededRelayRoute {
+            relay_secret,
+            route_id,
+            ..
+        } = seed_relay_route(
+            &db,
+            RelayRouteSeed {
+                base_url: format!("http://{address}"),
+                provider: "openai-compatible",
+                auth_mode: "bearer",
+                provider_secret: "provider-secret".to_string(),
+                wire_api: "openai-responses",
+                public_model: "public-responses-model",
+                upstream_model: "upstream-responses-model",
+            },
+        )
+        .await;
+        let state = test_state(db, database_path.clone());
+
+        let response = relay_openai_responses(
+            State(state.clone()),
+            relay_headers(&relay_secret),
+            Uri::from_static("/openai/v1/responses"),
+            Bytes::from_static(
+                br#"{"model":"public-responses-model","input":"hello","stream":true}"#,
+            ),
+        )
+        .await
+        .expect("relay response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let relay_body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read relay response");
+        assert_eq!(relay_body.as_ref(), STREAM.as_bytes());
+        server.abort();
+
+        let logs = state
+            .db
+            .list_request_logs(1)
+            .await
+            .expect("list request logs");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status_code, 502);
+        assert_eq!(
+            (
+                logs[0].input_tokens,
+                logs[0].cached_input_tokens,
+                logs[0].output_tokens,
+            ),
+            (13, 10, 8)
+        );
+        assert_eq!(
+            logs[0].error.as_deref(),
+            Some("upstream stream failed (server_error)")
+        );
+        let route = state
+            .db
+            .get_provider_model_route(&route_id)
+            .await
+            .expect("get provider route")
+            .expect("provider route");
+        assert_eq!(route.status, "cooling_down");
+        assert_eq!(route.last_status_code, Some(502));
+        assert!(route.cooldown_until.is_some());
+
+        drop(state);
+        remove_test_database(&database_path);
+    }
+
+    #[tokio::test]
+    async fn observed_application_failure_wins_over_client_disconnect() {
+        const STREAM: &str = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"temporary upstream failure\"}\n\n"
+        );
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                let chunks = stream::once(async {
+                    Ok::<_, Infallible>(Bytes::from_static(STREAM.as_bytes()))
+                })
+                .chain(stream::pending());
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(chunks))
+                    .expect("build upstream response")
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let address = listener.local_addr().expect("upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("serve upstream");
+        });
+
+        let database_path = test_database_path();
+        let db = Db::open(&database_path).await.expect("open test database");
+        let SeededRelayRoute {
+            relay_secret,
+            route_id,
+            ..
+        } = seed_relay_route(
+            &db,
+            RelayRouteSeed {
+                base_url: format!("http://{address}"),
+                provider: "openai-compatible",
+                auth_mode: "bearer",
+                provider_secret: "provider-secret".to_string(),
+                wire_api: "openai-responses",
+                public_model: "public-responses-model",
+                upstream_model: "upstream-responses-model",
+            },
+        )
+        .await;
+        let state = test_state(db, database_path.clone());
+
+        let response = relay_openai_responses(
+            State(state.clone()),
+            relay_headers(&relay_secret),
+            Uri::from_static("/openai/v1/responses"),
+            Bytes::from_static(
+                br#"{"model":"public-responses-model","input":"hello","stream":true}"#,
+            ),
+        )
+        .await
+        .expect("relay response");
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(
+            body.next()
+                .await
+                .expect("first response chunk")
+                .expect("valid response chunk")
+                .as_ref(),
+            STREAM.as_bytes()
+        );
+        drop(body);
+
+        let mut logs = Vec::new();
+        for _ in 0..20 {
+            logs = state
+                .db
+                .list_request_logs(1)
+                .await
+                .expect("list request logs");
+            if !logs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        server.abort();
+
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status_code, 502);
+        assert_eq!(
+            logs[0].error.as_deref(),
+            Some("upstream stream failed (server_error)")
+        );
+        let route = state
+            .db
+            .get_provider_model_route(&route_id)
+            .await
+            .expect("get provider route")
+            .expect("provider route");
+        assert_eq!(route.status, "cooling_down");
+        assert_eq!(route.last_status_code, Some(502));
+        assert!(route.cooldown_until.is_some());
 
         drop(state);
         remove_test_database(&database_path);
@@ -2674,7 +2977,7 @@ mod tests {
 
     #[test]
     fn streaming_usage_merges_anthropic_events_across_chunks() {
-        let mut usage = StreamingUsage::default();
+        let mut usage = StreamingResponseObservation::default();
         for chunk in [
             &b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":17,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":3,\"output_tokens\":1}}}\n\n"[..],
             &b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"out"[..],
@@ -2716,5 +3019,53 @@ mod tests {
                 output_tokens: 8,
             }
         );
+    }
+
+    #[test]
+    fn streaming_observation_tracks_openai_responses_failure() {
+        let mut observation = StreamingResponseObservation::default();
+        observation.observe(
+            b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"temporary upstream failure\"}}}\n\n",
+        );
+
+        let failure = observation
+            .application_failure(WireApi::OpenAiResponses)
+            .expect("application failure");
+        assert_eq!(failure.code.as_deref(), Some("server_error"));
+        assert_eq!(failure.log_error(), "upstream stream failed (server_error)");
+    }
+
+    #[test]
+    fn streaming_failure_logs_exclude_provider_messages_and_unsafe_codes() {
+        let failure = openai_responses_stream_failure(&json!({
+            "type": "error",
+            "code": "unsafe code with spaces",
+            "message": "prompt text or credentials must not reach request logs"
+        }))
+        .expect("application failure");
+
+        assert_eq!(failure.code, None);
+        assert_eq!(failure.log_error(), "upstream stream failed");
+    }
+
+    #[test]
+    fn streaming_application_failures_are_responses_only() {
+        let mut observation = StreamingResponseObservation::default();
+        observation.observe(
+            b"event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"temporary upstream failure\"}\n\n",
+        );
+
+        assert!(
+            observation
+                .application_failure(WireApi::OpenAiResponses)
+                .is_some()
+        );
+        for wire_api in [
+            WireApi::OpenAiChat,
+            WireApi::AnthropicMessages,
+            WireApi::GeminiGenerateContent,
+        ] {
+            assert_eq!(observation.application_failure(wire_api), None);
+        }
     }
 }
