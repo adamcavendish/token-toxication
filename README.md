@@ -3,7 +3,8 @@
 Token Toxication is a Rust + React relay service. It provides self-hosted
 Anthropic Messages, OpenAI Responses, OpenAI Chat, and Gemini GenerateContent
 relay endpoints, admin-managed API keys, provider account rotation, request
-logging, and a Vite+ shadcn dashboard.
+logging, provider-reported token and cache analytics, and a Vite+ shadcn
+dashboard.
 
 ## Layout
 
@@ -202,6 +203,13 @@ Request logs store sanitized upstream metadata only: the upstream origin and
 path without query parameters, top-level request keys, body byte size, stream
 flag, and stripped param names. They do not store prompt/message/input content,
 authorization headers, API keys, or raw upstream bodies.
+
+When the provider reports usage, request logs also store input, cached input,
+and output token counts. Streaming requests are finalized after the upstream
+stream ends so terminal usage events are captured. The admin overview reports
+today's cache hit rate as cached input tokens divided by input tokens, and each
+request row shows its own rate. Older rows and providers that do not report
+cached usage display 0%.
 
 ## Configuration
 
