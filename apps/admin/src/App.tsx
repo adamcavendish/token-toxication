@@ -1992,6 +1992,10 @@ function ClientSetupView({
     () => opencodeModelOptions(models, routes, accounts),
     [accounts, models, routes],
   );
+  const piModels = useMemo(() => {
+    const responseModels = new Set(codexModels);
+    return enabledCatalogModelOptions(models).filter((model) => responseModels.has(model.id));
+  }, [codexModels, models]);
   const opencodeModelIds = useMemo(() => opencodeModels.map((model) => model.id), [opencodeModels]);
   const [codexModel, setCodexModel] = useState("");
   const [claudeModel, setClaudeModel] = useState("");
@@ -2021,8 +2025,17 @@ function ClientSetupView({
         claudeModel,
         opencodeModel: selectedOpencodeModel,
         opencodeModels,
+        piModels,
       }),
-    [apiKey, serviceOrigin, codexModel, claudeModel, selectedOpencodeModel, opencodeModels],
+    [
+      apiKey,
+      serviceOrigin,
+      codexModel,
+      claudeModel,
+      selectedOpencodeModel,
+      opencodeModels,
+      piModels,
+    ],
   );
   const keyLooksValid = apiKey.trim() === "" || apiKey.trim().startsWith("tokentoxication-");
 
@@ -2120,6 +2133,7 @@ function ClientSetupView({
             <TabsTrigger value="codex">Codex</TabsTrigger>
             <TabsTrigger value="claude">Claude Code</TabsTrigger>
             <TabsTrigger value="opencode">opencode</TabsTrigger>
+            <TabsTrigger value="pi">Pi</TabsTrigger>
           </TabsList>
           <TabsContent value="codex">
             <ClientSnippetCard
@@ -2156,6 +2170,22 @@ function ClientSetupView({
               <EmptyNotice
                 title="No opencode routes"
                 body="Add an eligible OpenAI Chat or Responses route to generate an opencode config."
+              />
+            )}
+          </TabsContent>
+          <TabsContent value="pi">
+            {piModels.length > 0 ? (
+              <ClientSnippetCard
+                title="Pi custom provider"
+                description="Writes a complete Pi models.json file using the OpenAI Responses API. Back up any existing Pi configuration first."
+                endpoint="/openai/v1/responses"
+                model={`${piModels.length} routed model${piModels.length === 1 ? "" : "s"}`}
+                snippet={snippets.pi}
+              />
+            ) : (
+              <EmptyNotice
+                title="No Pi routes"
+                body="Add an eligible OpenAI Responses route to generate a Pi provider config."
               />
             )}
           </TabsContent>
@@ -3515,6 +3545,7 @@ function buildClientSetupSnippets({
   claudeModel,
   opencodeModel,
   opencodeModels,
+  piModels,
 }: {
   apiKey: string;
   serviceOrigin: string;
@@ -3522,6 +3553,7 @@ function buildClientSetupSnippets({
   claudeModel: string;
   opencodeModel: string;
   opencodeModels: OpencodeModelOption[];
+  piModels: ClientModelOption[];
 }) {
   const origin = serviceOrigin.replace(/\/+$/, "");
   const relayApiKey = apiKey.trim() || "tokentoxication-REPLACE_ME";
@@ -3567,6 +3599,25 @@ function buildClientSetupSnippets({
     null,
     2,
   );
+  const piModelsConfig = JSON.stringify(
+    {
+      providers: {
+        "token-toxication": {
+          name: "Token Toxication",
+          baseUrl: openaiBaseUrl,
+          api: "openai-responses",
+          apiKey: "$TOKEN_TOXICATION_API_KEY",
+          models: piModels.map((model) => ({
+            id: model.id,
+            name: model.displayName,
+            reasoning: true,
+          })),
+        },
+      },
+    },
+    null,
+    2,
+  );
 
   return {
     openaiBaseUrl,
@@ -3602,6 +3653,14 @@ function buildClientSetupSnippets({
       "JSON",
       "",
       "opencode",
+    ].join("\n"),
+    pi: [
+      `export TOKEN_TOXICATION_API_KEY=${shellQuote(relayApiKey)}`,
+      "mkdir -p ~/.pi/agent",
+      "cat > ~/.pi/agent/models.json <<'JSON'",
+      piModelsConfig,
+      "JSON",
+      "pi",
     ].join("\n"),
   };
 }
