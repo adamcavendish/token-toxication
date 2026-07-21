@@ -254,24 +254,42 @@ pub async fn codex_account_quota(
     account_id: &str,
 ) -> Result<CodexAccountQuotaResponse, AppError> {
     let account = codex_account_record(db, account_id).await?;
-    let authorization = codex_subscription_authorization(db, http, &account).await?;
-    let endpoint = codex_quota_endpoint(&account.account.base_url)?;
-    let payload = fetch_codex_usage(
-        http,
-        &endpoint,
-        &authorization.access_token,
-        authorization.account_id.as_deref(),
-        CODEX_QUOTA_TIMEOUT,
-    )
-    .await?;
+    let result = async {
+        let authorization = codex_subscription_authorization(db, http, &account).await?;
+        let endpoint = codex_quota_endpoint(&account.account.base_url)?;
+        let payload = fetch_codex_usage(
+            http,
+            &endpoint,
+            &authorization.access_token,
+            authorization.account_id.as_deref(),
+            CODEX_QUOTA_TIMEOUT,
+        )
+        .await?;
 
-    Ok(codex_quota_response(
-        account.account.id,
-        account.account.auth_mode,
-        endpoint,
-        payload,
-        Utc::now(),
-    ))
+        Ok(codex_quota_response(
+            account.account.id.clone(),
+            account.account.auth_mode.clone(),
+            endpoint,
+            payload,
+            Utc::now(),
+        ))
+    }
+    .await;
+
+    match result {
+        Ok(quota) => {
+            db.mark_provider_result(&account.account.id, "healthy", None)
+                .await?;
+            Ok(quota)
+        }
+        Err(error) => {
+            if matches!(error, AppError::Unauthorized(_)) {
+                db.mark_provider_result(&account.account.id, "blocked", Some(&error.to_string()))
+                    .await?;
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn codex_account_record(
@@ -643,8 +661,10 @@ mod tests {
     use axum::{Json, Router, http::HeaderMap, routing::get};
     use serde_json::json;
     use tokio::net::TcpListener;
+    use uuid::Uuid;
 
     use super::*;
+    use crate::{db::Db, models::CreateProviderAccountRequest};
 
     fn jwt(claims: Value) -> String {
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
@@ -1000,6 +1020,61 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("codex-cli")
         );
+    }
+
+    #[tokio::test]
+    async fn successful_quota_check_restores_account_health() {
+        let app = Router::new().route(
+            "/backend-api/wham/usage",
+            get(|| async { Json(json!({ "plan_type": "plus", "rate_limit": null })) }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let path =
+            std::env::temp_dir().join(format!("token-toxication-{}.sqlite3", Uuid::new_v4()));
+        let db = Db::open(&path).await.expect("open test database");
+        let account = db
+            .create_provider_account(CreateProviderAccountRequest {
+                name: "Codex".to_string(),
+                provider: "codex-subscription".to_string(),
+                base_url: format!("http://{address}/backend-api"),
+                auth_mode: "codex-oauth".to_string(),
+                wire_api: "openai-responses".to_string(),
+                api_key: json!({
+                    "type": STORED_CODEX_CREDENTIAL_TYPE,
+                    "refresh": "refresh-token",
+                    "access": "access-token",
+                    "expires": Utc::now().timestamp_millis() + 60_000,
+                    "accountId": "account-1"
+                })
+                .to_string(),
+                is_active: true,
+                priority: 0,
+            })
+            .await
+            .expect("create Codex account");
+        db.mark_provider_result(&account.id, "blocked", Some("expired credential"))
+            .await
+            .expect("block account");
+
+        codex_account_quota(&db, &test_http_client(), &account.id)
+            .await
+            .expect("quota response");
+
+        let account = db
+            .get_provider_account(&account.id)
+            .await
+            .expect("load account")
+            .expect("account exists");
+        assert_eq!(account.status, "healthy");
+        assert!(account.last_error.is_none());
+
+        server.abort();
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

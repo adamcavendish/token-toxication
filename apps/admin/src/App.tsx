@@ -512,6 +512,7 @@ function App() {
       toast.error(message);
     } finally {
       setIsCodexDetailsLoading(false);
+      await refresh();
     }
   }
 

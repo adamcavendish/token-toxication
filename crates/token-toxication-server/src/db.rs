@@ -841,8 +841,8 @@ impl Db {
             wire_api,
             is_active: input.is_active.unwrap_or(current.is_active),
             priority: input.priority.unwrap_or(current.priority),
-            status: current.status,
-            last_error: current.last_error,
+            status: "healthy".to_string(),
+            last_error: None,
             created_at: current.created_at,
             last_used_at: current.last_used_at,
         };
@@ -851,8 +851,8 @@ impl Db {
         if let Some(api_key) = input.api_key {
             conn.execute(
                 "UPDATE provider_accounts SET name = ?1, provider = ?2, base_url = ?3,
-                 auth_mode = ?4, wire_api = ?5, api_key = ?6, is_active = ?7, priority = ?8
-                 WHERE id = ?9",
+                 auth_mode = ?4, wire_api = ?5, api_key = ?6, is_active = ?7, priority = ?8,
+                 status = 'healthy', last_error = NULL WHERE id = ?9",
                 params![
                     &account.name,
                     &account.provider,
@@ -868,8 +868,8 @@ impl Db {
         } else {
             conn.execute(
                 "UPDATE provider_accounts SET name = ?1, provider = ?2, base_url = ?3,
-                 auth_mode = ?4, wire_api = ?5, is_active = ?6, priority = ?7
-                 WHERE id = ?8",
+                 auth_mode = ?4, wire_api = ?5, is_active = ?6, priority = ?7,
+                 status = 'healthy', last_error = NULL WHERE id = ?8",
                 params![
                     &account.name,
                     &account.provider,
@@ -1994,6 +1994,9 @@ mod tests {
             .await
             .expect("create Codex account");
         assert_eq!(account.base_url, "https://relay.example/backend-api");
+        db.mark_provider_result(&account.id, "blocked", Some("expired credential"))
+            .await
+            .expect("block Codex account");
 
         let account = db
             .update_provider_account(
@@ -2014,6 +2017,8 @@ mod tests {
             .await
             .expect("update Codex account");
         assert_eq!(account.base_url, "https://relay.example/tenant/backend-api");
+        assert_eq!(account.status, "healthy");
+        assert!(account.last_error.is_none());
 
         drop(db);
         let _ = std::fs::remove_file(path);
