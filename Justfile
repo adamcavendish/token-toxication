@@ -55,6 +55,10 @@ ui-install:
 ui-check:
     cd apps/admin && vp check
 
+# Run focused frontend tests
+ui-test:
+    cd apps/admin && vp test --run
+
 # Build admin UI
 ui-build:
     cd apps/admin && vp build
@@ -66,4 +70,4 @@ ui-dev:
 # ---------- CI ----------
 
 # Run the full local CI pipeline
-ci: fmt-check clippy test sdk-generate ui-check ui-build
+ci: fmt-check clippy test sdk-generate ui-check ui-test ui-build
