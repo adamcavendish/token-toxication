@@ -717,6 +717,40 @@ impl Db {
         &self,
         wire_apis: &[&str],
     ) -> Result<Vec<RoutableModelCatalogEntry>, rusqlite::Error> {
+        let entries = self.list_routable_model_catalog_entries().await?;
+        let mut models = Vec::new();
+        for model in entries {
+            if !wire_apis.contains(&model.wire_api.as_str())
+                || models
+                    .iter()
+                    .any(|existing: &RoutableModelCatalogEntry| existing.id == model.id)
+            {
+                continue;
+            }
+            models.push(model);
+        }
+        Ok(models)
+    }
+
+    pub async fn list_routable_model_catalog_by_wire(
+        &self,
+    ) -> Result<Vec<RoutableModelCatalogEntry>, rusqlite::Error> {
+        let entries = self.list_routable_model_catalog_entries().await?;
+        let mut models = Vec::new();
+        for model in entries {
+            if models.iter().any(|existing: &RoutableModelCatalogEntry| {
+                existing.id == model.id && existing.wire_api == model.wire_api
+            }) {
+                continue;
+            }
+            models.push(model);
+        }
+        Ok(models)
+    }
+
+    async fn list_routable_model_catalog_entries(
+        &self,
+    ) -> Result<Vec<RoutableModelCatalogEntry>, rusqlite::Error> {
         let conn = self.conn.lock().await;
         let now = Utc::now().to_rfc3339();
         let mut stmt = conn.prepare(
@@ -746,19 +780,7 @@ impl Db {
                 created_at: parse_time(row.get::<_, String>(5)?.as_str()),
             })
         })?;
-        let mut models = Vec::new();
-        for row in rows {
-            let model = row?;
-            if !wire_apis.contains(&model.wire_api.as_str())
-                || models
-                    .iter()
-                    .any(|existing: &RoutableModelCatalogEntry| existing.id == model.id)
-            {
-                continue;
-            }
-            models.push(model);
-        }
-        Ok(models)
+        rows.collect()
     }
 
     pub async fn select_provider_account(
@@ -2231,9 +2253,17 @@ mod tests {
         })
         .await
         .expect("create inactive model");
+        db.create_model_catalog_entry(CreateModelCatalogEntryRequest {
+            id: "unrouted-model".to_string(),
+            display_name: String::new(),
+            family: "deepseek".to_string(),
+            enabled: true,
+        })
+        .await
+        .expect("create unrouted model");
         db.create_provider_model_route(CreateProviderModelRouteRequest {
             public_model_id: "deepseek-v4-pro".to_string(),
-            provider_account_id: deepseek.id,
+            provider_account_id: deepseek.id.clone(),
             upstream_model_id: "deepseek-v4-pro".to_string(),
             wire_api: "openai-chat".to_string(),
             role: "primary".to_string(),
@@ -2242,6 +2272,17 @@ mod tests {
         })
         .await
         .expect("create primary route");
+        db.create_provider_model_route(CreateProviderModelRouteRequest {
+            public_model_id: "deepseek-v4-pro".to_string(),
+            provider_account_id: deepseek.id.clone(),
+            upstream_model_id: "deepseek-v4-pro-backup".to_string(),
+            wire_api: "openai-chat".to_string(),
+            role: "backup".to_string(),
+            enabled: true,
+            strip_params: Vec::new(),
+        })
+        .await
+        .expect("create duplicate chat route");
         db.create_provider_model_route(CreateProviderModelRouteRequest {
             public_model_id: "deepseek-v4-pro".to_string(),
             provider_account_id: duplicate.id,
@@ -2265,6 +2306,59 @@ mod tests {
         .await
         .expect("create inactive route");
 
+        let mut blocked_route_id = None;
+        let mut cooling_route_id = None;
+        for (id, model_enabled, route_enabled) in [
+            ("disabled-model", false, true),
+            ("disabled-route", true, false),
+            ("blocked-route", true, true),
+            ("cooling-route", true, true),
+        ] {
+            db.create_model_catalog_entry(CreateModelCatalogEntryRequest {
+                id: id.to_string(),
+                display_name: String::new(),
+                family: "deepseek".to_string(),
+                enabled: model_enabled,
+            })
+            .await
+            .expect("create ineligible model");
+            let route = db
+                .create_provider_model_route(CreateProviderModelRouteRequest {
+                    public_model_id: id.to_string(),
+                    provider_account_id: deepseek.id.clone(),
+                    upstream_model_id: id.to_string(),
+                    wire_api: "openai-chat".to_string(),
+                    role: "primary".to_string(),
+                    enabled: route_enabled,
+                    strip_params: Vec::new(),
+                })
+                .await
+                .expect("create ineligible route");
+            match id {
+                "blocked-route" => blocked_route_id = Some(route.id),
+                "cooling-route" => cooling_route_id = Some(route.id),
+                _ => {}
+            }
+        }
+        db.mark_route_failure(
+            blocked_route_id.as_deref().expect("blocked route id"),
+            "blocked",
+            Some(401),
+            "invalid credential",
+            None,
+        )
+        .await
+        .expect("block route");
+        db.mark_route_failure(
+            cooling_route_id.as_deref().expect("cooling route id"),
+            "cooling",
+            Some(429),
+            "rate limited",
+            Some(Utc::now() + chrono::Duration::minutes(1)),
+        )
+        .await
+        .expect("cool route");
+
         let models = db
             .list_routable_model_catalog(&["openai-chat", "openai-responses"])
             .await
@@ -2275,6 +2369,21 @@ mod tests {
         assert_eq!(models[0].display_name, "DeepSeek V4 Pro");
         assert_eq!(models[0].provider, "deepseek");
         assert_eq!(models[0].wire_api, "openai-chat");
+
+        let models_by_wire = db
+            .list_routable_model_catalog_by_wire()
+            .await
+            .expect("list model catalog by wire");
+        assert_eq!(
+            models_by_wire
+                .iter()
+                .map(|model| (model.id.as_str(), model.wire_api.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("deepseek-v4-pro", "openai-chat"),
+                ("deepseek-v4-pro", "openai-responses"),
+            ]
+        );
 
         let _ = std::fs::remove_file(path);
     }

@@ -440,6 +440,19 @@ pub struct ModelCatalogListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct RoutableModelCatalogEntry {
+    pub id: String,
+    pub wire_api: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutableModelCatalogListResponse {
+    pub data: Vec<RoutableModelCatalogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelCatalogEntryResponse {
     pub data: ModelCatalogEntry,
 }

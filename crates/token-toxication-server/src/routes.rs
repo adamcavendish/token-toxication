@@ -46,9 +46,9 @@ use crate::{
         MetricsResponse, ModelCatalogEntryResponse, ModelCatalogListResponse, OpenAiModel,
         OpenAiModelListResponse, ProviderAccountListResponse, ProviderAccountResponse,
         ProviderModelRouteListResponse, ProviderModelRouteResponse, ProviderPresetListResponse,
-        RequestLogListResponse, RequestSummary, UpdateApiKeyRequest,
-        UpdateModelCatalogEntryRequest, UpdateProviderAccountRequest,
-        UpdateProviderModelRouteRequest,
+        RequestLogListResponse, RequestSummary, RoutableModelCatalogEntry,
+        RoutableModelCatalogListResponse, UpdateApiKeyRequest, UpdateModelCatalogEntryRequest,
+        UpdateProviderAccountRequest, UpdateProviderModelRouteRequest,
     },
     provider_catalog::provider_presets,
     relay_attempt::{RelayAttempt, RelayAttemptLog, TokenUsage, authenticate_relay_api_key},
@@ -93,6 +93,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             "/model-catalog",
             get(list_model_catalog).post(create_model_catalog_entry),
         )
+        .route("/routable-model-catalog", get(list_routable_model_catalog))
         .route("/model-catalog/{id}", patch(update_model_catalog_entry))
         .route(
             "/provider-model-routes",
@@ -887,6 +888,22 @@ pub async fn list_model_catalog(
     Ok(Json(ModelCatalogListResponse {
         data: state.db.list_model_catalog().await?,
     }))
+}
+
+pub async fn list_routable_model_catalog(
+    State(state): State<AppState>,
+) -> Result<Json<RoutableModelCatalogListResponse>, AppError> {
+    let data = state
+        .db
+        .list_routable_model_catalog_by_wire()
+        .await?
+        .into_iter()
+        .map(|model| RoutableModelCatalogEntry {
+            id: model.id,
+            wire_api: model.wire_api,
+        })
+        .collect();
+    Ok(Json(RoutableModelCatalogListResponse { data }))
 }
 
 pub async fn create_model_catalog_entry(
@@ -1926,6 +1943,56 @@ mod tests {
         assert_eq!(error.to_string(), "missing API key");
 
         drop(state);
+        remove_test_database(&database_path);
+    }
+
+    #[tokio::test]
+    async fn routable_model_catalog_requires_admin_authentication() {
+        let database_path = test_database_path();
+        let db = Db::open(&database_path).await.expect("open test database");
+        let state = test_state(db, database_path.clone());
+        state
+            .db
+            .create_admin_session(
+                "test-admin-token",
+                "admin",
+                Utc::now() + chrono::Duration::hours(1),
+            )
+            .await
+            .expect("create admin session");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                crate::app(state, PathBuf::from("missing-admin-assets")),
+            )
+            .await
+            .expect("serve");
+        });
+        let endpoint = format!("http://{address}/admin/api/routable-model-catalog");
+        let http = test_http_client();
+
+        let unauthenticated = http
+            .get(&endpoint)
+            .expect("build unauthenticated request")
+            .send()
+            .await
+            .expect("send unauthenticated request");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let authenticated = http
+            .get(&endpoint)
+            .expect("build authenticated request")
+            .bearer_auth("test-admin-token")
+            .send()
+            .await
+            .expect("send authenticated request");
+        assert_eq!(authenticated.status(), StatusCode::OK);
+
+        server.abort();
+        let _ = server.await;
         remove_test_database(&database_path);
     }
 

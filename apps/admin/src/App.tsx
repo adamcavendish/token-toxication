@@ -35,6 +35,7 @@ import type {
   ProviderPreset,
   RequestLog,
   RequestTrend,
+  RoutableModelCatalogEntry,
 } from "./types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -234,6 +235,7 @@ function App() {
   const [accounts, setAccounts] = useState<ProviderAccount[]>([]);
   const [providerPresets, setProviderPresets] = useState<ProviderPreset[]>([]);
   const [modelCatalog, setModelCatalog] = useState<ModelCatalogEntry[]>([]);
+  const [routableModels, setRoutableModels] = useState<RoutableModelCatalogEntry[]>([]);
   const [modelRoutes, setModelRoutes] = useState<ProviderModelRoute[]>([]);
   const [logs, setLogs] = useState<RequestLog[]>([]);
   const [isLoading, setIsLoading] = useState(Boolean(token));
@@ -270,6 +272,7 @@ function App() {
         nextAccounts,
         nextPresets,
         nextCatalog,
+        nextRoutableModels,
         nextRoutes,
         nextLogs,
       ] = await Promise.all([
@@ -278,6 +281,7 @@ function App() {
         api.providerAccounts(),
         api.providerPresets(),
         api.modelCatalog(),
+        api.routableModelCatalog(),
         api.providerModelRoutes(),
         api.requestLogs(50),
       ]);
@@ -286,6 +290,7 @@ function App() {
       setAccounts(nextAccounts);
       setProviderPresets(nextPresets);
       setModelCatalog(nextCatalog);
+      setRoutableModels(nextRoutableModels);
       setModelRoutes(nextRoutes);
       setLogs(nextLogs);
     } catch (error) {
@@ -792,9 +797,8 @@ function App() {
                   ) : null}
                   {view === "setup" ? (
                     <ClientSetupView
-                      accounts={accounts}
                       models={modelCatalog}
-                      routes={modelRoutes}
+                      routableModels={routableModels}
                       apiKey={clientSetupApiKey}
                       setApiKey={setClientSetupApiKey}
                     />
@@ -2077,15 +2081,13 @@ function ModelCatalogView({
 }
 
 function ClientSetupView({
-  accounts,
   models,
-  routes,
+  routableModels,
   apiKey,
   setApiKey,
 }: {
-  accounts: ProviderAccount[];
   models: ModelCatalogEntry[];
-  routes: ProviderModelRoute[];
+  routableModels: RoutableModelCatalogEntry[];
   apiKey: string;
   setApiKey: React.Dispatch<React.SetStateAction<string>>;
 }) {
@@ -2095,20 +2097,20 @@ function ClientSetupView({
   );
   const catalogModels = useMemo(() => catalogModelIds(models), [models]);
   const codexModels = useMemo(
-    () => routableModelsForWireApis(models, routes, accounts, ["openai-responses"]),
-    [accounts, models, routes],
+    () => routableModelIdsForWireApi(routableModels, "openai-responses"),
+    [routableModels],
   );
   const chatModels = useMemo(
-    () => routableModelsForWireApis(models, routes, accounts, ["openai-chat"]),
-    [accounts, models, routes],
+    () => routableModelIdsForWireApi(routableModels, "openai-chat"),
+    [routableModels],
   );
   const claudeModels = useMemo(
-    () => routableModelsForWireApis(models, routes, accounts, ["anthropic-messages"]),
-    [accounts, models, routes],
+    () => routableModelIdsForWireApi(routableModels, "anthropic-messages"),
+    [routableModels],
   );
   const opencodeModels = useMemo(
-    () => opencodeModelOptions(models, routes, accounts),
-    [accounts, models, routes],
+    () => opencodeModelOptions(models, routableModels),
+    [models, routableModels],
   );
   const piModels = useMemo(() => {
     const responseModels = new Set(codexModels);
@@ -3597,39 +3599,8 @@ function applyAccountPreset(
   }));
 }
 
-function routableModelsForWireApis(
-  models: ModelCatalogEntry[],
-  routes: ProviderModelRoute[],
-  accounts: ProviderAccount[],
-  wireApis: string[],
-) {
-  const acceptedWireApis = new Set(wireApis);
-  const activeAccounts = new Set(
-    accounts
-      .filter((account) => account.isActive && account.status !== "blocked")
-      .map((account) => account.id),
-  );
-  const routableIds = new Set(
-    routes
-      .filter(
-        (route) =>
-          routeIsEligible(route) &&
-          acceptedWireApis.has(route.wireApi) &&
-          activeAccounts.has(route.providerAccountId),
-      )
-      .map((route) => route.publicModelId),
-  );
-  return uniqueSorted(
-    models.filter((model) => model.enabled && routableIds.has(model.id)).map((model) => model.id),
-  );
-}
-
-function routeIsEligible(route: ProviderModelRoute) {
-  return (
-    route.enabled &&
-    route.status !== "blocked" &&
-    (!route.cooldownUntil || new Date(route.cooldownUntil).getTime() <= Date.now())
-  );
+function routableModelIdsForWireApi(models: RoutableModelCatalogEntry[], wireApi: string) {
+  return uniqueSorted(models.filter((model) => model.wireApi === wireApi).map((model) => model.id));
 }
 
 function catalogModelIds(models: ModelCatalogEntry[]) {
@@ -3648,13 +3619,10 @@ function enabledCatalogModelOptions(models: ModelCatalogEntry[]): ClientModelOpt
 
 function opencodeModelOptions(
   models: ModelCatalogEntry[],
-  routes: ProviderModelRoute[],
-  accounts: ProviderAccount[],
+  routableModels: RoutableModelCatalogEntry[],
 ): OpencodeModelOption[] {
-  const chatModels = new Set(routableModelsForWireApis(models, routes, accounts, ["openai-chat"]));
-  const responseModels = new Set(
-    routableModelsForWireApis(models, routes, accounts, ["openai-responses"]),
-  );
+  const chatModels = new Set(routableModelIdsForWireApi(routableModels, "openai-chat"));
+  const responseModels = new Set(routableModelIdsForWireApi(routableModels, "openai-responses"));
 
   return enabledCatalogModelOptions(models)
     .filter((model) => chatModels.has(model.id) || responseModels.has(model.id))

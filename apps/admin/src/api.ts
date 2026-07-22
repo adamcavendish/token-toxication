@@ -18,6 +18,7 @@ import type {
   ProviderModelRoute,
   ProviderPreset,
   RequestLog,
+  RoutableModelCatalogEntry,
   UpdateApiKeyRequest,
   UpdateModelCatalogEntryRequest,
   UpdateProviderAccountRequest,
@@ -177,6 +178,11 @@ export const api = {
 
   async modelCatalog(): Promise<ModelCatalogEntry[]> {
     const response = await callApi(adminApi.listModelCatalog());
+    return [...response.data];
+  },
+
+  async routableModelCatalog(): Promise<RoutableModelCatalogEntry[]> {
+    const response = await callApi(adminApi.listRoutableModelCatalog());
     return [...response.data];
   },
 

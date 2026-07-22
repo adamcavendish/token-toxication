@@ -29,6 +29,7 @@ export type {
   ProviderPreset,
   RequestLog,
   RequestTrend,
+  RoutableModelCatalogEntry,
   UpdateApiKeyRequest,
   UpdateModelCatalogEntryRequest,
   UpdateProviderAccountRequest,

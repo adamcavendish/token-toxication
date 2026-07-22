@@ -16,8 +16,9 @@ use crate::models::{
     ProviderAccount, ProviderAccountListResponse, ProviderAccountResponse, ProviderModelRoute,
     ProviderModelRouteListResponse, ProviderModelRouteResponse, ProviderPreset,
     ProviderPresetListResponse, RequestLog, RequestLogListResponse, RequestSummary, RequestTrend,
-    RequestTrendBucket, UpdateApiKeyRequest, UpdateModelCatalogEntryRequest,
-    UpdateProviderAccountRequest, UpdateProviderModelRouteRequest, UsageSummary,
+    RequestTrendBucket, RoutableModelCatalogEntry, RoutableModelCatalogListResponse,
+    UpdateApiKeyRequest, UpdateModelCatalogEntryRequest, UpdateProviderAccountRequest,
+    UpdateProviderModelRouteRequest, UsageSummary,
 };
 
 #[derive(OpenApi)]
@@ -50,6 +51,7 @@ use crate::models::{
         get_gemini_account_quota,
         get_codex_account_quota,
         list_model_catalog,
+        list_routable_model_catalog,
         create_model_catalog_entry,
         update_model_catalog_entry,
         list_provider_model_routes,
@@ -122,6 +124,8 @@ use crate::models::{
         RequestLog,
         RequestLogListResponse,
         RequestSummary,
+        RoutableModelCatalogEntry,
+        RoutableModelCatalogListResponse,
         RequestTrend,
         RequestTrendBucket,
         UpdateApiKeyRequest,
@@ -378,6 +382,18 @@ pub fn list_provider_presets() {}
     responses((status = 200, description = "Model catalog entries", body = ModelCatalogListResponse)),
 )]
 pub fn list_model_catalog() {}
+
+#[utoipa::path(
+    get,
+    path = "/admin/api/routable-model-catalog",
+    tag = "Admin",
+    responses((
+        status = 200,
+        description = "Eligible catalog models by wire protocol",
+        body = RoutableModelCatalogListResponse
+    )),
+)]
+pub fn list_routable_model_catalog() {}
 
 #[utoipa::path(
     post,
