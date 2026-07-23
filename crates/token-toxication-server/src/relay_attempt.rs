@@ -172,6 +172,20 @@ impl RelayAttempt {
         .await
     }
 
+    pub(crate) async fn record_server_shutdown(
+        &self,
+        log: &RelayAttemptLog,
+        usage: TokenUsage,
+    ) -> Result<(), AppError> {
+        self.insert_request_log(
+            log,
+            CLIENT_CLOSED_REQUEST_STATUS,
+            usage,
+            Some("server shut down before the upstream stream completed".to_string()),
+        )
+        .await
+    }
+
     async fn insert_request_log(
         &self,
         log: &RelayAttemptLog,

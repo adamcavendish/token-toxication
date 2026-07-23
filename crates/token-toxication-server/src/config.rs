@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Args, ValueEnum};
 
@@ -89,6 +89,12 @@ pub struct Config {
     #[arg(long, env = "TT_STATIC_DIR", default_value = "apps/admin/dist")]
     pub static_dir: PathBuf,
 
+    #[arg(long, env = "TT_RELAY_STREAM_IDLE_TIMEOUT_SECS", default_value_t = 60)]
+    pub relay_stream_idle_timeout_secs: u64,
+
+    #[arg(long, env = "TT_RELAY_STREAM_MAX_DURATION_SECS", default_value_t = 900)]
+    pub relay_stream_max_duration_secs: u64,
+
     #[arg(long, env = "TT_ADMIN_USERNAME", default_value = "admin")]
     pub admin_username: String,
 
@@ -117,6 +123,7 @@ impl Config {
     }
 
     pub fn https_config(&self) -> Result<HttpsConfig, ConfigError> {
+        self.validate_relay_timeouts()?;
         match self.https_mode {
             HttpsMode::Off => Ok(HttpsConfig::Off),
             HttpsMode::CertFiles => {
@@ -182,6 +189,24 @@ impl Config {
             );
         }
     }
+
+    pub fn relay_stream_idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.relay_stream_idle_timeout_secs)
+    }
+
+    pub fn relay_stream_max_duration(&self) -> Duration {
+        Duration::from_secs(self.relay_stream_max_duration_secs)
+    }
+
+    fn validate_relay_timeouts(&self) -> Result<(), ConfigError> {
+        if self.relay_stream_idle_timeout_secs == 0 {
+            return Err(ConfigError::ZeroRelayStreamIdleTimeout);
+        }
+        if self.relay_stream_max_duration_secs == 0 {
+            return Err(ConfigError::ZeroRelayStreamMaxDuration);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +214,7 @@ mod tests {
     use std::{net::SocketAddr, path::PathBuf};
 
     use super::{Config, HttpsMode, LETS_ENCRYPT_PRODUCTION_DIRECTORY};
+    use crate::error::ConfigError;
 
     fn test_config() -> Config {
         Config {
@@ -204,6 +230,8 @@ mod tests {
             acme_directory_url: LETS_ENCRYPT_PRODUCTION_DIRECTORY.to_string(),
             database_path: PathBuf::from("data/token-toxication.sqlite3"),
             static_dir: PathBuf::from("apps/admin/dist"),
+            relay_stream_idle_timeout_secs: 60,
+            relay_stream_max_duration_secs: 900,
             admin_username: "admin".to_string(),
             admin_password: "change-this-password".to_string(),
             api_key_prefix: "tokentoxication-".to_string(),
@@ -267,5 +295,22 @@ mod tests {
         config.acme_http_bind_addr = "127.0.0.1:8080".parse().unwrap();
         config.acme_allow_nonstandard_http_port = true;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn relay_timeouts_must_be_positive() {
+        let mut config = test_config();
+        config.relay_stream_idle_timeout_secs = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::ZeroRelayStreamIdleTimeout)
+        ));
+
+        let mut config = test_config();
+        config.relay_stream_max_duration_secs = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::ZeroRelayStreamMaxDuration)
+        ));
     }
 }

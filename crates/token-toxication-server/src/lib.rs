@@ -15,7 +15,7 @@ pub mod routing;
 pub mod server;
 pub mod static_assets;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use axum::Router;
 use chrono::{DateTime, Utc};
@@ -40,6 +40,9 @@ pub struct AppState {
     pub http: aioduct::TokioClient,
     pub gemini_http: aioduct::TokioClient,
     pub antigravity_oauth: antigravity_oauth::AntigravityOAuthStore,
+    pub relay_stream_idle_timeout: Duration,
+    pub relay_stream_max_duration: Duration,
+    pub shutdown: server::ShutdownSignal,
     pub started_at: DateTime<Utc>,
 }
 

@@ -13,18 +13,20 @@ dependencies = [
 
 [[package]]
 name = "aioduct"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c269f3acce4b5b8491308ad6f009cfc38df8466b872899bc8792050955aadfa1"
+checksum = "66f6f9a39c3686a0fdef2c630758332dfce20944609d82fd1d2d21d9b13178a3"
 dependencies = [
  "base64",
  "bytes",
  "coarsetime",
  "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
+ "httparse",
  "hyper",
  "memchr",
  "percent-encoding",
@@ -37,7 +39,7 @@ dependencies = [
  "tokio",
  "url",
  "webpki-roots",
- "x509-parser 0.17.0",
+ "x509-parser",
 ]
 
 [[package]]
@@ -982,7 +984,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
- "x509-parser 0.18.1",
+ "x509-parser",
 ]
 
 [[package]]
@@ -1408,7 +1410,7 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "time",
- "x509-parser 0.18.1",
+ "x509-parser",
  "yasna",
 ]
 
@@ -1958,7 +1960,7 @@ dependencies = [
  "url",
  "utoipa",
  "uuid",
- "x509-parser 0.18.1",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2585,23 +2587,6 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
-
-[[package]]
-name = "x509-parser"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4569f339c0c402346d4a75a9e39cf8dad310e287eef1ff56d4c68e5067f53460"
-dependencies = [
- "asn1-rs",
- "data-encoding",
- "der-parser",
- "lazy_static",
- "nom",
- "oid-registry",
- "rusticata-macros",
- "thiserror",
- "time",
-]
 
 [[package]]
 name = "x509-parser"

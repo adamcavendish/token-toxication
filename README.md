@@ -37,7 +37,7 @@ The application ships as a Rust server with an embedded React admin interface an
 
 ### Prerequisites
 
-- Rust 1.88 or newer
+- Rust 1.95 or newer
 - [just](https://github.com/casey/just)
 - Vite+ with the `vp` command available
 - `openapi-nexus` for SDK generation
@@ -297,6 +297,8 @@ Every server option is available as a command-line flag and, where listed, an en
 | `TT_BIND_ADDR` | `0.0.0.0:3000` | Main HTTP or HTTPS listener |
 | `TT_DATABASE_PATH` | `data/token-toxication.sqlite3` | SQLite database path |
 | `TT_STATIC_DIR` | `apps/admin/dist` | Optional external admin build; embedded assets are the fallback |
+| `TT_RELAY_STREAM_IDLE_TIMEOUT_SECS` | `60` | Maximum gap between upstream streaming response chunks |
+| `TT_RELAY_STREAM_MAX_DURATION_SECS` | `900` | Maximum lifetime of one relay stream |
 | `TT_ADMIN_USERNAME` | `admin` | Admin login username |
 | `TT_ADMIN_PASSWORD` | `change-this-password` | Admin login password; change before deployment |
 | `TT_API_KEY_PREFIX` | `tokentoxication-` | Prefix for generated relay keys |

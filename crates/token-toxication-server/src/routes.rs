@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, time::Duration};
 
 use aioduct::{
     RequestBuilderSend, SseDecoder, SseEvent,
@@ -18,7 +18,10 @@ use chrono::Utc;
 use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::{
+    sync::mpsc,
+    time::{self, Instant},
+};
 
 use crate::{
     AppState,
@@ -445,6 +448,9 @@ async fn relay_json_endpoint(
         .unwrap_or(false);
 
     if is_stream {
+        let stream_idle_timeout = state.relay_stream_idle_timeout;
+        let stream_max_duration = state.relay_stream_max_duration;
+        let shutdown = state.shutdown.clone();
         let body_stream = stream::unfold(response.into_bytes_stream(), |mut body| async move {
             body.next().await.map(|chunk| {
                 let chunk = chunk.map_err(std::io::Error::other);
@@ -453,11 +459,16 @@ async fn relay_json_endpoint(
         });
         let body_stream = record_streaming_response(
             body_stream,
-            attempt,
-            log,
-            status,
-            response_headers,
-            wire_api,
+            StreamingResponseContext {
+                attempt,
+                log,
+                status,
+                response_headers,
+                wire_api,
+                idle_timeout: stream_idle_timeout,
+                max_duration: stream_max_duration,
+                shutdown,
+            },
         );
         let body = Body::from_stream(body_stream);
         let mut relay = Response::builder()
@@ -596,6 +607,9 @@ async fn relay_gemini_endpoint(
         .unwrap_or_else(|| HeaderValue::from_static("application/json"));
 
     if method.is_stream() {
+        let stream_idle_timeout = state.relay_stream_idle_timeout;
+        let stream_max_duration = state.relay_stream_max_duration;
+        let shutdown = state.shutdown.clone();
         let body_stream = stream::unfold(
             (
                 response.into_bytes_stream(),
@@ -635,11 +649,16 @@ async fn relay_gemini_endpoint(
         );
         let body_stream = record_streaming_response(
             body_stream,
-            attempt,
-            log,
-            status,
-            response_headers,
-            WireApi::GeminiGenerateContent,
+            StreamingResponseContext {
+                attempt,
+                log,
+                status,
+                response_headers,
+                wire_api: WireApi::GeminiGenerateContent,
+                idle_timeout: stream_idle_timeout,
+                max_duration: stream_max_duration,
+                shutdown,
+            },
         );
         let body = Body::from_stream(body_stream);
         let mut relay = Response::builder()
@@ -1338,20 +1357,41 @@ enum StreamEnd {
     Complete,
     UpstreamError(io::Error),
     ClientDisconnected,
+    IdleTimeout(Duration),
+    MaximumDuration(Duration),
+    ServerShuttingDown,
 }
 
-fn record_streaming_response<S>(
-    body_stream: S,
+struct StreamingResponseContext {
     attempt: RelayAttempt,
     log: RelayAttemptLog,
     status: StatusCode,
     response_headers: HeaderMap,
     wire_api: WireApi,
+    idle_timeout: Duration,
+    max_duration: Duration,
+    shutdown: crate::server::ShutdownSignal,
+}
+
+fn record_streaming_response<S>(
+    body_stream: S,
+    context: StreamingResponseContext,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
 {
     const BUFFERED_CHUNKS: usize = 1;
+
+    let StreamingResponseContext {
+        attempt,
+        log,
+        status,
+        response_headers,
+        wire_api,
+        idle_timeout,
+        max_duration,
+        shutdown,
+    } = context;
 
     // The owned task can finalize the attempt after upstream EOF while the
     // bounded channel preserves downstream backpressure.
@@ -1359,20 +1399,35 @@ where
     tokio::spawn(async move {
         let mut body_stream = Box::pin(body_stream);
         let mut observation = StreamingResponseObservation::default();
-        let stream_end = loop {
-            let next = tokio::select! {
-                _ = sender.closed() => break StreamEnd::ClientDisconnected,
-                next = body_stream.next() => next,
-            };
-            match next {
-                Some(Ok(chunk)) => {
-                    observation.observe(&chunk);
-                    if sender.send(Ok(chunk)).await.is_err() {
-                        break StreamEnd::ClientDisconnected;
+        let deadline = Instant::now() + max_duration;
+        let mut shutdown_rx = shutdown.subscribe();
+        let stream_end = if *shutdown_rx.borrow() {
+            StreamEnd::ServerShuttingDown
+        } else {
+            loop {
+                let next = tokio::select! {
+                    _ = sender.closed() => break StreamEnd::ClientDisconnected,
+                    changed = shutdown_rx.changed() => match changed {
+                        Ok(()) if *shutdown_rx.borrow_and_update() => break StreamEnd::ServerShuttingDown,
+                        Ok(()) => continue,
+                        Err(_) => break StreamEnd::ServerShuttingDown,
+                    },
+                    _ = time::sleep_until(deadline) => break StreamEnd::MaximumDuration(max_duration),
+                    next = time::timeout(idle_timeout, body_stream.next()) => match next {
+                        Ok(next) => next,
+                        Err(_) => break StreamEnd::IdleTimeout(idle_timeout),
+                    },
+                };
+                match next {
+                    Some(Ok(chunk)) => {
+                        observation.observe(&chunk);
+                        if sender.send(Ok(chunk)).await.is_err() {
+                            break StreamEnd::ClientDisconnected;
+                        }
                     }
+                    Some(Err(error)) => break StreamEnd::UpstreamError(error),
+                    None => break StreamEnd::Complete,
                 }
-                Some(Err(error)) => break StreamEnd::UpstreamError(error),
-                None => break StreamEnd::Complete,
             }
         };
 
@@ -1433,6 +1488,45 @@ where
                 }
                 return;
             }
+            StreamEnd::IdleTimeout(duration) => {
+                let error = stream_timeout_error("was idle", duration);
+                let failure = classify_transport_failure(error.to_string(), Utc::now());
+                if let Err(record_error) = attempt.record_failure(&log, failure).await {
+                    tracing::error!(
+                        error = %record_error,
+                        path = %log.path,
+                        "failed to record upstream stream idle timeout"
+                    );
+                }
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+            StreamEnd::MaximumDuration(duration) => {
+                let error = stream_timeout_error("exceeded its maximum lifetime of", duration);
+                let failure = classify_transport_failure(error.to_string(), Utc::now());
+                if let Err(record_error) = attempt.record_failure(&log, failure).await {
+                    tracing::error!(
+                        error = %record_error,
+                        path = %log.path,
+                        "failed to record upstream stream maximum duration"
+                    );
+                }
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+            StreamEnd::ServerShuttingDown => {
+                if let Err(error) = attempt
+                    .record_server_shutdown(&log, observation.tokens())
+                    .await
+                {
+                    tracing::error!(
+                        %error,
+                        path = %log.path,
+                        "failed to record stream interrupted by server shutdown"
+                    );
+                }
+                return;
+            }
             StreamEnd::Complete => {}
         }
 
@@ -1449,6 +1543,13 @@ where
     stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|item| (item, receiver))
     })
+}
+
+fn stream_timeout_error(reason: &str, duration: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("upstream stream {reason} {} seconds", duration.as_secs()),
+    )
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1779,6 +1880,7 @@ mod tests {
             .tls(aioduct::tls::RustlsConnector::with_webpki_roots())
             .user_agent("token-toxication-test")
             .timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(5))
             .build()
             .expect("build test HTTP client")
     }
@@ -1798,6 +1900,8 @@ mod tests {
                 acme_directory_url: LETS_ENCRYPT_PRODUCTION_DIRECTORY.to_string(),
                 database_path,
                 static_dir: PathBuf::from("apps/admin/dist"),
+                relay_stream_idle_timeout_secs: 60,
+                relay_stream_max_duration_secs: 900,
                 admin_username: "admin".to_string(),
                 admin_password: "test-password".to_string(),
                 api_key_prefix: "tokentoxication-".to_string(),
@@ -1807,6 +1911,9 @@ mod tests {
             http: test_http_client(),
             gemini_http: test_http_client(),
             antigravity_oauth: AntigravityOAuthStore::default(),
+            relay_stream_idle_timeout: Duration::from_secs(5),
+            relay_stream_max_duration: Duration::from_secs(900),
+            shutdown: crate::server::ShutdownSignal::for_test(),
             started_at: Utc::now(),
         }
     }
@@ -2494,6 +2601,200 @@ mod tests {
         assert_eq!(
             logs[0].error.as_deref(),
             Some("client disconnected before the upstream stream completed")
+        );
+        let route = state
+            .db
+            .get_provider_model_route(&route_id)
+            .await
+            .expect("get provider route")
+            .expect("provider route");
+        assert_eq!(route.status, "healthy");
+        assert_eq!(route.last_status_code, None);
+
+        drop(state);
+        remove_test_database(&database_path);
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_ends_without_waiting_for_the_upstream() {
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                let chunks = stream::pending::<Result<Bytes, Infallible>>();
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(chunks))
+                    .expect("build upstream response")
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let address = listener.local_addr().expect("upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("serve upstream");
+        });
+
+        let database_path = test_database_path();
+        let db = Db::open(&database_path).await.expect("open test database");
+        let SeededRelayRoute {
+            relay_secret,
+            route_id,
+            ..
+        } = seed_relay_route(
+            &db,
+            RelayRouteSeed {
+                base_url: format!("http://{address}"),
+                provider: "openai-compatible",
+                auth_mode: "bearer",
+                provider_secret: "provider-secret".to_string(),
+                wire_api: "openai-responses",
+                public_model: "public-responses-model",
+                upstream_model: "upstream-responses-model",
+            },
+        )
+        .await;
+        let mut state = test_state(db, database_path.clone());
+        state.relay_stream_idle_timeout = Duration::from_millis(20);
+
+        let response = relay_openai_responses(
+            State(state.clone()),
+            relay_headers(&relay_secret),
+            Uri::from_static("/openai/v1/responses"),
+            Bytes::from_static(
+                br#"{"model":"public-responses-model","input":"hello","stream":true}"#,
+            ),
+        )
+        .await
+        .expect("relay response");
+        let mut body = response.into_body().into_data_stream();
+        let error = tokio::time::timeout(Duration::from_millis(100), body.next())
+            .await
+            .expect("stalled stream must end promptly")
+            .expect("stalled stream must return an error")
+            .expect_err("stalled stream must fail");
+        assert!(error.to_string().contains("upstream stream"));
+
+        let mut logs = Vec::new();
+        for _ in 0..20 {
+            logs = state
+                .db
+                .list_request_logs(1)
+                .await
+                .expect("list request logs");
+            if !logs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        server.abort();
+
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status_code, 502);
+        assert!(
+            logs[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("upstream stream"))
+        );
+        let route = state
+            .db
+            .get_provider_model_route(&route_id)
+            .await
+            .expect("get provider route")
+            .expect("provider route");
+        assert_eq!(route.status, "cooling_down");
+        assert_eq!(route.last_status_code, None);
+
+        drop(state);
+        remove_test_database(&database_path);
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_stalled_stream_without_penalizing_the_route() {
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                let chunks = stream::pending::<Result<Bytes, Infallible>>();
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(chunks))
+                    .expect("build upstream response")
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let address = listener.local_addr().expect("upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("serve upstream");
+        });
+
+        let database_path = test_database_path();
+        let db = Db::open(&database_path).await.expect("open test database");
+        let SeededRelayRoute {
+            relay_secret,
+            route_id,
+            ..
+        } = seed_relay_route(
+            &db,
+            RelayRouteSeed {
+                base_url: format!("http://{address}"),
+                provider: "openai-compatible",
+                auth_mode: "bearer",
+                provider_secret: "provider-secret".to_string(),
+                wire_api: "openai-responses",
+                public_model: "public-responses-model",
+                upstream_model: "upstream-responses-model",
+            },
+        )
+        .await;
+        let state = test_state(db, database_path.clone());
+
+        let response = relay_openai_responses(
+            State(state.clone()),
+            relay_headers(&relay_secret),
+            Uri::from_static("/openai/v1/responses"),
+            Bytes::from_static(
+                br#"{"model":"public-responses-model","input":"hello","stream":true}"#,
+            ),
+        )
+        .await
+        .expect("relay response");
+        let mut body = response.into_body().into_data_stream();
+        state.shutdown.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), body.next())
+                .await
+                .expect("shutdown must end the stream promptly")
+                .is_none()
+        );
+
+        let mut logs = Vec::new();
+        for _ in 0..20 {
+            logs = state
+                .db
+                .list_request_logs(1)
+                .await
+                .expect("list request logs");
+            if !logs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        server.abort();
+
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status_code, 499);
+        assert_eq!(
+            logs[0].error.as_deref(),
+            Some("server shut down before the upstream stream completed")
         );
         let route = state
             .db

@@ -35,6 +35,10 @@ pub enum ConfigError {
          explicit public-port forwarding"
     )]
     NonstandardAcmeHttpPort,
+    #[error("--relay-stream-idle-timeout-secs must be greater than zero")]
+    ZeroRelayStreamIdleTimeout,
+    #[error("--relay-stream-max-duration-secs must be greater than zero")]
+    ZeroRelayStreamMaxDuration,
 }
 
 #[derive(Debug, thiserror::Error)]

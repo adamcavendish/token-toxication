@@ -47,6 +47,8 @@ async fn run_server(config: Config) -> Result<(), MainError> {
 
     let https_config = config.https_config()?;
     config.warn_if_default_admin_password();
+    let relay_stream_idle_timeout = config.relay_stream_idle_timeout();
+    let relay_stream_max_duration = config.relay_stream_max_duration();
     let config = Arc::new(config);
     let db = Db::open(&config.database_path)
         .await
@@ -54,10 +56,21 @@ async fn run_server(config: Config) -> Result<(), MainError> {
             path: config.database_path.clone(),
             source,
         })?;
-    let http = build_http_client("token-toxication/0.1", Duration::from_secs(300), false)
-        .map_err(|source| MainError::BuildHttpClient { source })?;
-    let gemini_http = build_http_client("token-toxication/0.1", Duration::from_secs(300), true)
-        .map_err(|source| MainError::BuildHttpClient { source })?;
+    let http = build_http_client(
+        "token-toxication/0.1",
+        Duration::from_secs(300),
+        relay_stream_idle_timeout,
+        false,
+    )
+    .map_err(|source| MainError::BuildHttpClient { source })?;
+    let gemini_http = build_http_client(
+        "token-toxication/0.1",
+        Duration::from_secs(300),
+        relay_stream_idle_timeout,
+        true,
+    )
+    .map_err(|source| MainError::BuildHttpClient { source })?;
+    let shutdown = server::ShutdownSignal::new();
 
     let state = AppState {
         config: config.clone(),
@@ -65,17 +78,21 @@ async fn run_server(config: Config) -> Result<(), MainError> {
         http,
         gemini_http,
         antigravity_oauth: Default::default(),
+        relay_stream_idle_timeout,
+        relay_stream_max_duration,
+        shutdown: shutdown.clone(),
         started_at: Utc::now(),
     };
 
     let app = app(state, config.static_dir.clone());
-    server::serve(config, https_config, app).await?;
+    server::serve(config, https_config, app, shutdown).await?;
     Ok(())
 }
 
 fn build_http_client(
     user_agent: &str,
     timeout: Duration,
+    read_timeout: Duration,
     http1_only: bool,
 ) -> Result<aioduct::TokioClient, aioduct::Error> {
     let mut tls = aioduct::tls::RustlsConnector::with_webpki_roots();
@@ -86,6 +103,7 @@ fn build_http_client(
         .tls(tls)
         .user_agent(user_agent)
         .timeout(timeout)
+        .read_timeout(read_timeout)
         .build()
 }
 

@@ -170,15 +170,15 @@ impl AcmeManager {
 
     pub async fn prepare_certificate(&self) -> Result<ManagedCertificate, AcmeError> {
         self.ensure_cert_dir().await?;
-        if let Some(certificate) = self.load_certificate().await? {
-            if certificate.info.not_after > Utc::now() {
-                tracing::info!(
-                    identifier = certificate.info.identifier,
-                    not_after = %certificate.info.not_after,
-                    "using existing ACME certificate"
-                );
-                return Ok(certificate);
-            }
+        if let Some(certificate) = self.load_certificate().await?
+            && certificate.info.not_after > Utc::now()
+        {
+            tracing::info!(
+                identifier = certificate.info.identifier,
+                not_after = %certificate.info.not_after,
+                "using existing ACME certificate"
+            );
+            return Ok(certificate);
         }
 
         self.issue_certificate().await
